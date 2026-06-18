@@ -1,0 +1,11 @@
+node_modules/
+.next/
+out/
+.env.local
+.env*.local
+*.tsbuildinfo
+next-env.d.ts
+*.fab
+.backup/
+.DS_Store
+提示词.txt
