@@ -346,68 +346,89 @@ async function processFile(file, spaceNameArr, index) {
     var base64Image = buffer.toString("base64");
     var mimeType = file.type || "image/jpeg";
 
-    var apiUrl = (process.env.SPARK_API_URL || "https://maas-api.cn-huabei-1.xf-yun.com/anthropic") + "/v1/messages";
+    // 尝试两个路径：/v1/messages（标准 Anthropic）→ 原始地址
+    var apiBase = process.env.SPARK_API_URL || "https://maas-api.cn-huabei-1.xf-yun.com/anthropic";
+    // Vercel Hobby 60s 限制，每个尝试 25s
+    var SPARK_TIMEOUT = 25000;
 
-    console.log("Spark API 请求地址:", apiUrl);
-    console.log("Spark 模型:", process.env.SPARK_MODEL || "xopqwen36v35b");
+    var sparkRes = null;
+    var lastErr = null;
 
-    var sparkRes = await axios.post(
-      apiUrl,
-      {
-        model: process.env.SPARK_MODEL || "xopqwen36v35b",
-        max_tokens: 4096,
-        messages: [
+    // 第1轮：尝试 /v1/messages
+    var urlsToTry = [
+      apiBase.replace(/\/+$/, "") + "/v1/messages",
+      apiBase.replace(/\/+$/, ""),
+    ];
+
+    for (var u = 0; u < urlsToTry.length; u++) {
+      try {
+        console.log("Spark API 尝试 #" + (u + 1) + ":", urlsToTry[u]);
+        sparkRes = await axios.post(
+          urlsToTry[u],
           {
-            role: "user",
-            content: [
-              { type: "text", text: promptContent },
+            model: process.env.SPARK_MODEL || "xopqwen36v35b",
+            max_tokens: 4096,
+            messages: [
               {
-                type: "image",
-                source: {
-                  type: "base64",
-                  media_type: mimeType,
-                  data: base64Image,
-                },
+                role: "user",
+                content: [
+                  { type: "text", text: promptContent },
+                  {
+                    type: "image",
+                    source: {
+                      type: "base64",
+                      media_type: mimeType,
+                      data: base64Image,
+                    },
+                  },
+                ],
               },
             ],
           },
-        ],
-      },
-      {
-        headers: {
-          "x-api-key": process.env.SPARK_API_KEY,
-          "Content-Type": "application/json",
-        },
-        timeout: 120000,
+          {
+            headers: {
+              "x-api-key": process.env.SPARK_API_KEY || "",
+              "Content-Type": "application/json",
+            },
+            timeout: SPARK_TIMEOUT,
+          }
+        );
+        // 请求成功则跳出循环
+        if (sparkRes && sparkRes.status < 500) break;
+      } catch (err) {
+        lastErr = err;
+        console.warn("Spark API 尝试 #" + (u + 1) + " 失败:", err.message);
+        // 非网络错误（如 4xx）直接跳出，不继续尝试
+        if (err.response && err.response.status < 500) {
+          console.error("服务器拒绝了请求 (HTTP " + err.response.status + "):",
+            JSON.stringify(err.response.data).slice(0, 300));
+          break;
+        }
       }
-    );
+    }
 
-    analysisRaw = sparkRes.data.content[0].text;
-    analysis = tryParseJson(analysisRaw);
-
-    if (!analysis) {
-      console.warn(
-        "Spark API 返回非JSON内容（第" +
-          (index + 1) +
-          "张），前200字符:",
-        analysisRaw?.slice(0, 200)
+    if (sparkRes && sparkRes.data && sparkRes.data.content && sparkRes.data.content[0]) {
+      analysisRaw = sparkRes.data.content[0].text || "";
+      analysis = tryParseJson(analysisRaw);
+      console.log(
+        "Spark 分析结果:",
+        analysis ? (analysis.styleDefinition?.coreStyle || "JSON OK") : "非JSON，前200字: " + (analysisRaw?.slice(0, 200) || "空")
       );
     } else {
-      console.log(
-        "Spark 分析成功:",
-        analysis.styleDefinition?.coreStyle || "未知风格"
-      );
+      if (lastErr) {
+        console.error("Spark API 最终失败（第" + (index + 1) + "张图）:", lastErr.message);
+        if (lastErr.response) {
+          console.error(
+            "状态:", lastErr.response.status,
+            "数据:", JSON.stringify(lastErr.response.data).slice(0, 500)
+          );
+        }
+      } else {
+        console.warn("Spark API 返回空响应（第" + (index + 1) + "张图）");
+      }
     }
   } catch (err) {
-    console.error("Spark API 分析错误（第" + (index + 1) + "张图）:", err.message);
-    if (err.response) {
-      console.error(
-        "Spark 响应状态:",
-        err.response.status,
-        "数据:",
-        JSON.stringify(err.response.data).slice(0, 500)
-      );
-    }
+    console.error("Spark API 调用异常（第" + (index + 1) + "张图）:", err.message);
   }
 
   // 4. 提取用于搜索的字段
