@@ -239,14 +239,14 @@ async function processSingleImage(fileInfo, index, promptContent, batchId) {
     var analysisRaw = "";
     var analysis = null;
 
-    var apiBase = process.env.SPARK_API_URL || "https://maas-api.cn-huabei-1.xf-yun.com/anthropic";
-    var urlsToTry = [apiBase.replace(/\/+$/, "") + "/v1/messages", apiBase.replace(/\/+$/, "")];
+    var apiBase = (process.env.SPARK_API_URL || "https://dashscope.aliyuncs.com/apps/anthropic").replace(/\/+$/, "");
+    var urlsToTry = [apiBase + "/v1/messages", apiBase];
     var sparkRes = null;
 
     for (var u = 0; u < urlsToTry.length; u++) {
       try {
         sparkRes = await axios.post(urlsToTry[u], {
-          model: process.env.SPARK_MODEL || "xopqwen36v35b",
+          model: process.env.SPARK_MODEL || "qwen-max-latest",
           max_tokens: 4096,
           messages: [{
             role: "user",
@@ -257,7 +257,7 @@ async function processSingleImage(fileInfo, index, promptContent, batchId) {
           }],
         }, {
           headers: { "x-api-key": process.env.SPARK_API_KEY || "", "Content-Type": "application/json" },
-          timeout: 30000,
+          timeout: 60000,
         });
         if (sparkRes && sparkRes.status < 500) break;
       } catch (err) {

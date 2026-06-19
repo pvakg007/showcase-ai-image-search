@@ -1,8 +1,5 @@
 "use client";
 
-// 避免静态生成导致 Vercel 404
-export const dynamic = "force-dynamic";
-
 import { useState, useEffect, useCallback } from "react";
 import PreviewModal from "../components/PreviewModal";
 
