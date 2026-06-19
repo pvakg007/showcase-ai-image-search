@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
+import PreviewModal from "./components/PreviewModal";
 
 interface ImageItem {
   id: number;
@@ -10,11 +11,12 @@ interface ImageItem {
   summary: string;
   tags: string[];
   spaceName?: string;
+  spaceNames?: string[];
   createdAt: number;
 }
 
 /**
- * 防抖 Hook：延迟更新值，避免频繁触发搜索请求
+ * 防抖 Hook
  */
 function useDebounce<T>(value: T, delay: number): T {
   const [debouncedValue, setDebouncedValue] = useState(value);
@@ -33,7 +35,13 @@ export default function Home() {
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
 
-  // 防抖后的搜索文本
+  // 预览弹窗状态
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewType, setPreviewType] = useState<"image" | "markdown">(
+    "image"
+  );
+  const [previewTitle, setPreviewTitle] = useState("");
+
   const debouncedSearchText = useDebounce(searchText, 300);
 
   // 页面加载和搜索条件变化时自动搜索
@@ -44,12 +52,10 @@ export default function Home() {
   const fetchData = async () => {
     setLoading(true);
     try {
-      // 构建搜索查询
       const query: { q: string; filter?: string } = {
         q: debouncedSearchText,
       };
 
-      // Meilisearch 筛选语法：tags = "tag1" AND tags = "tag2"
       if (selectedTags.length > 0) {
         query.filter = selectedTags
           .map((tag) => `tags = "${tag}"`)
@@ -71,7 +77,6 @@ export default function Home() {
     }
   };
 
-  // 点击标签添加/移除筛选
   const toggleTag = (tag: string) => {
     if (selectedTags.includes(tag)) {
       setSelectedTags(selectedTags.filter((t) => t !== tag));
@@ -80,15 +85,35 @@ export default function Home() {
     }
   };
 
-  // 清除所有筛选
   const clearFilters = () => {
     setSearchText("");
     setSelectedTags([]);
   };
 
-  // 从搜索框中删除指定关键词
   const removeSearchTag = (tag: string) => {
     setSelectedTags(selectedTags.filter((t) => t !== tag));
+  };
+
+  // 打开预览弹窗
+  const openPreview = useCallback(
+    (url: string, type: "image" | "markdown", title: string) => {
+      setPreviewUrl(url);
+      setPreviewType(type);
+      setPreviewTitle(title);
+    },
+    []
+  );
+
+  const closePreview = useCallback(() => {
+    setPreviewUrl(null);
+  }, []);
+
+  // 获取显示用的空间名称
+  const displaySpaceName = (img: ImageItem): string => {
+    if (img.spaceNames && img.spaceNames.length > 0)
+      return img.spaceNames.join("、");
+    if (img.spaceName) return img.spaceName;
+    return "";
   };
 
   return (
@@ -120,7 +145,6 @@ export default function Home() {
             </a>
           </div>
 
-          {/* 已选中的关键词标签 */}
           {selectedTags.length > 0 && (
             <div className="flex flex-wrap gap-2 mb-2">
               <span className="text-gray-600">已选关键词:</span>
@@ -148,81 +172,102 @@ export default function Home() {
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
-            {images.map((img) => (
-              <div
-                key={img.id}
-                className="bg-white rounded-lg shadow-md overflow-hidden hover:shadow-lg transition-shadow"
-              >
-                {/* 图片 */}
-                <div className="aspect-square overflow-hidden">
-                  <img
-                    src={img.url}
-                    alt={img.title}
-                    className="w-full h-full object-cover hover:scale-105 transition-transform duration-300"
-                  />
-                </div>
+            {images.map((img) => {
+              const spaceLabel = displaySpaceName(img);
+              return (
+                <div
+                  key={img.id}
+                  className="bg-white rounded-lg shadow-md overflow-hidden hover:shadow-lg transition-shadow"
+                >
+                  {/* 图片 */}
+                  <div
+                    className="aspect-square overflow-hidden cursor-pointer"
+                    onClick={() =>
+                      openPreview(img.url, "image", img.title)
+                    }
+                  >
+                    <img
+                      src={img.url}
+                      alt={img.title}
+                      className="w-full h-full object-cover hover:scale-105 transition-transform duration-300"
+                    />
+                  </div>
 
-                {/* 内容 */}
-                <div className="p-4">
-                  <h3 className="font-semibold text-lg mb-2 truncate">
-                    {img.title}
-                  </h3>
-                  {img.spaceName && (
-                    <p className="text-amber-700 text-xs mb-1">
-                      📍 {img.spaceName}
-                    </p>
-                  )}
-                  <p className="text-gray-600 text-sm mb-3 line-clamp-2">
-                    {img.summary}
-                  </p>
-
-                  {/* 关键词标签 */}
-                  <div className="flex flex-wrap gap-1 mb-3">
-                    {img.tags.slice(0, 5).map((tag) => (
-                      <span
-                        key={tag}
-                        className={`px-2 py-1 rounded-full text-xs cursor-pointer transition-colors ${
-                          selectedTags.includes(tag)
-                            ? "bg-blue-500 text-white"
-                            : "bg-gray-100 text-gray-700 hover:bg-gray-200"
-                        }`}
-                        onClick={() => toggleTag(tag)}
-                      >
-                        {tag}
-                      </span>
-                    ))}
-                    {img.tags.length > 5 && (
-                      <span className="px-2 py-1 bg-gray-100 text-gray-500 rounded-full text-xs">
-                        +{img.tags.length - 5}
-                      </span>
+                  <div className="p-4">
+                    <h3 className="font-semibold text-lg mb-2 truncate">
+                      {img.title}
+                    </h3>
+                    {spaceLabel && (
+                      <p className="text-amber-700 text-xs mb-1">
+                        📍 {spaceLabel}
+                      </p>
                     )}
-                  </div>
+                    <p className="text-gray-600 text-sm mb-3 line-clamp-2">
+                      {img.summary}
+                    </p>
 
-                  {/* 操作按钮 */}
-                  <div className="flex gap-2">
-                    <a
-                      href={img.mdUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex-1 px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-center text-sm transition-colors"
-                    >
-                      查看总结
-                    </a>
-                    <a
-                      href={img.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex-1 px-3 py-1 bg-blue-100 text-blue-700 hover:bg-blue-200 rounded text-center text-sm transition-colors"
-                    >
-                      查看原图
-                    </a>
+                    {/* 关键词标签 */}
+                    <div className="flex flex-wrap gap-1 mb-3">
+                      {img.tags.slice(0, 5).map((tag) => (
+                        <span
+                          key={tag}
+                          className={`px-2 py-1 rounded-full text-xs cursor-pointer transition-colors ${
+                            selectedTags.includes(tag)
+                              ? "bg-blue-500 text-white"
+                              : "bg-gray-100 text-gray-700 hover:bg-gray-200"
+                          }`}
+                          onClick={() => toggleTag(tag)}
+                        >
+                          {tag}
+                        </span>
+                      ))}
+                      {img.tags.length > 5 && (
+                        <span className="px-2 py-1 bg-gray-100 text-gray-500 rounded-full text-xs">
+                          +{img.tags.length - 5}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* 操作按钮 — 同页面预览 */}
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() =>
+                          openPreview(
+                            img.mdUrl,
+                            "markdown",
+                            img.title + " - 分析总结"
+                          )
+                        }
+                        className="flex-1 px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-center text-sm transition-colors"
+                      >
+                        查看总结
+                      </button>
+                      <button
+                        onClick={() =>
+                          openPreview(img.url, "image", img.title)
+                        }
+                        className="flex-1 px-3 py-1 bg-blue-100 text-blue-700 hover:bg-blue-200 rounded text-center text-sm transition-colors"
+                      >
+                        查看原图
+                      </button>
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
+
+      {/* 预览弹窗 */}
+      {previewUrl && (
+        <PreviewModal
+          url={previewUrl}
+          type={previewType}
+          title={previewTitle}
+          onClose={closePreview}
+        />
+      )}
     </main>
   );
 }

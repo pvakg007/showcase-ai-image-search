@@ -76,7 +76,7 @@ const EMBEDDED_PROMPT = [
 ].join("\n");
 
 /**
- * 尝试从 GLM 返回文本中解析 JSON（兼容多种返回格式）
+ * 尝试从大模型返回文本中解析 JSON（兼容多种返回格式）
  */
 function tryParseJson(text) {
   if (!text) return null;
@@ -102,7 +102,7 @@ function tryParseJson(text) {
 }
 
 /**
- * 从 GLM 分析结果中提取简化的 title/summary/tags 用于 Meilisearch 索引
+ * 从分析结果中提取简化的 title/summary/tags 用于 Meilisearch 索引
  */
 function extractSearchFields(analysis) {
   var title = "未命名图片";
@@ -183,7 +183,7 @@ function extractSearchFields(analysis) {
 /**
  * 构建丰富的 Markdown 总结文件内容
  */
-function buildMarkdown(analysis, imageUrl, timestamp, spaceName) {
+function buildMarkdown(analysis, imageUrl, timestamp, spaceNames) {
   var lines = [];
 
   try {
@@ -193,18 +193,22 @@ function buildMarkdown(analysis, imageUrl, timestamp, spaceName) {
     var spaces = analysis?.spaceSoftDecorationAnalysis;
     var ideas = analysis?.generalMatchingIdeas;
 
+    var spaceLabel = Array.isArray(spaceNames) && spaceNames.length > 0
+      ? spaceNames.join("、")
+      : "";
+
     lines.push(
-      "# " + (sd?.coreStyle || (spaceName ? spaceName + " 设计分析" : "设计分析"))
+      "# " + (sd?.coreStyle || (spaceLabel || "设计分析"))
     );
     lines.push("");
     lines.push("---");
     lines.push("");
 
-    if (sd || spaceName) {
+    if (sd || spaceLabel) {
       lines.push("## 基本信息");
       lines.push("- **上传时间**: " + new Date(timestamp).toLocaleString());
       lines.push("- **图片链接**: [查看原图](" + imageUrl + ")");
-      if (spaceName) lines.push("- **空间名称**: " + spaceName);
+      if (spaceLabel) lines.push("- **空间名称**: " + spaceLabel);
       lines.push("");
     }
 
@@ -300,15 +304,15 @@ function buildMarkdown(analysis, imageUrl, timestamp, spaceName) {
 }
 
 /**
- * 处理单个文件的完整流程：上传COS → GLM分析 → 生成MD → 索引Meilisearch
+ * 处理单个文件的完整流程：上传COS → Spark API 分析 → 生成MD → 索引Meilisearch
  */
-async function processFile(file, spaceName, index) {
+async function processFile(file, spaceNameArr, index) {
   var arrayBuffer = await file.arrayBuffer();
   var buffer = Buffer.from(arrayBuffer);
-  var timestamp = Date.now() + index; // 加 index 确保每张图时间戳不重复
+  var timestamp = Date.now() + index;
   var imageFilename = "images/" + timestamp + "-" + file.name;
 
-  // 1. 上传图片到腾讯云 COS（设置公共读权限）
+  // 1. 上传图片到腾讯云 COS（公共读权限）
   var imageResult = await cos.putObject({
     Bucket: process.env.COS_BUCKET,
     Region: process.env.COS_REGION,
@@ -329,68 +333,79 @@ async function processFile(file, spaceName, index) {
   }
 
   // 将空间名称嵌入提示词
-  promptContent =
-    "图 " +
-    (index + 1) +
-    "：" +
-    (spaceName || "未命名空间") +
-    "\n\n" +
-    promptContent;
+  var spaceLabel = Array.isArray(spaceNameArr) && spaceNameArr.length > 0
+    ? spaceNameArr.join("、")
+    : "未命名空间";
+  promptContent = "图 " + (index + 1) + "：" + spaceLabel + "\n\n" + promptContent;
 
-  // 3. 调用 GLM-4V 大模型分析图片
+  // 3. 调用 Spark API (Anthropic 兼容) 分析图片
   var analysis = null;
   var analysisRaw = "";
 
   try {
-    var glmRes = await axios.post(
-      "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+    var base64Image = buffer.toString("base64");
+    var mimeType = file.type || "image/jpeg";
+
+    var apiUrl = (process.env.SPARK_API_URL || "https://maas-api.cn-huabei-1.xf-yun.com/anthropic") + "/v1/messages";
+
+    console.log("Spark API 请求地址:", apiUrl);
+    console.log("Spark 模型:", process.env.SPARK_MODEL || "xopqwen36v35b");
+
+    var sparkRes = await axios.post(
+      apiUrl,
       {
-        model: "glm-4v",
+        model: process.env.SPARK_MODEL || "xopqwen36v35b",
+        max_tokens: 4096,
         messages: [
           {
             role: "user",
             content: [
               { type: "text", text: promptContent },
-              { type: "image_url", image_url: { url: imageUrl } },
+              {
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: mimeType,
+                  data: base64Image,
+                },
+              },
             ],
           },
         ],
-        temperature: 0.3,
-        // 注意: glm-4v 可能不支持 response_format，用提示词约束JSON输出
       },
       {
         headers: {
-          Authorization: "Bearer " + process.env.GLM_API_KEY,
+          "x-api-key": process.env.SPARK_API_KEY,
+          "Content-Type": "application/json",
         },
         timeout: 120000,
       }
     );
 
-    analysisRaw = glmRes.data.choices[0].message.content;
+    analysisRaw = sparkRes.data.content[0].text;
     analysis = tryParseJson(analysisRaw);
 
     if (!analysis) {
       console.warn(
-        "GLM 返回非JSON内容（第" +
+        "Spark API 返回非JSON内容（第" +
           (index + 1) +
           "张），前200字符:",
         analysisRaw?.slice(0, 200)
       );
-      // 原始内容仍保存到 COS，方便排查
     } else {
       console.log(
-        "GLM 分析成功:",
+        "Spark 分析成功:",
         analysis.styleDefinition?.coreStyle || "未知风格"
       );
     }
   } catch (err) {
-    console.error("GLM 分析错误（第" + (index + 1) + "张图）:", err.message);
+    console.error("Spark API 分析错误（第" + (index + 1) + "张图）:", err.message);
     if (err.response) {
       console.error(
-        "GLM 响应状态:",
+        "Spark 响应状态:",
         err.response.status,
         "数据:",
-        JSON.stringify(err.response.data).slice(0, 300)
+        JSON.stringify(err.response.data).slice(0, 500)
       );
     }
   }
@@ -398,13 +413,15 @@ async function processFile(file, spaceName, index) {
   // 4. 提取用于搜索的字段
   var searchFields = extractSearchFields(analysis);
 
-  // 如果 GLM 分析彻底失败但有空间名称，用空间名称兜底
-  if (!analysis && spaceName) {
-    searchFields.title = spaceName + " 设计图片";
-    searchFields.summary = "空间名称：" + spaceName + "（AI 分析暂不可用，请稍后重试）";
-    if (searchFields.tags.indexOf(spaceName) === -1) {
-      searchFields.tags.push(spaceName);
-    }
+  // 兜底：分析失败但有空间名称
+  if (!analysis && spaceLabel && spaceLabel !== "未命名空间") {
+    searchFields.title = spaceLabel + " 设计图片";
+    searchFields.summary = "空间名称：" + spaceLabel + "（AI 分析暂不可用，请稍后重试）";
+    spaceNameArr.forEach(function (name) {
+      if (searchFields.tags.indexOf(name) === -1) {
+        searchFields.tags.push(name);
+      }
+    });
   } else if (!analysis) {
     searchFields.title = "设计图片 " + (index + 1);
     searchFields.summary = "等待 AI 分析完成";
@@ -415,7 +432,7 @@ async function processFile(file, spaceName, index) {
   var tags = searchFields.tags;
 
   // 5. 生成 MD 总结文件
-  var mdContent = buildMarkdown(analysis, imageUrl, timestamp, spaceName);
+  var mdContent = buildMarkdown(analysis, imageUrl, timestamp, spaceNameArr);
   var mdFilename =
     "summaries/" +
     timestamp +
@@ -434,8 +451,7 @@ async function processFile(file, spaceName, index) {
   });
   var mdUrl = "https://" + mdResult.Location;
 
-  // 7. 保存原始 JSON / 原始分析文本到 COS
-  var rawJsonUrl = "";
+  // 7. 保存原始分析文本到 COS
   if (analysisRaw) {
     try {
       var rawFilename =
@@ -452,7 +468,6 @@ async function processFile(file, spaceName, index) {
         ContentType: "application/json; charset=utf-8",
         ACL: "public-read",
       });
-      rawJsonUrl = "https://" + rawResult.Location;
     } catch (err) {
       console.warn("原始 JSON 保存失败:", err.message);
     }
@@ -466,7 +481,8 @@ async function processFile(file, spaceName, index) {
     title: title,
     summary: summary,
     tags: tags,
-    spaceName: spaceName || "",
+    spaceNames: spaceNameArr || [],
+    spaceName: (Array.isArray(spaceNameArr) ? spaceNameArr.join("、") : spaceNameArr || ""),
     createdAt: timestamp,
   };
 
@@ -507,20 +523,29 @@ export async function POST(req) {
       );
     }
 
-    // 获取空间名称列表（兼容新老字段名）
-    var spaceNames = formData.getAll("spaceNames") || [];
-    if (spaceNames.length === 0 && formData.get("spaceName")) {
-      spaceNames = [formData.get("spaceName")];
+    // 获取空间名称列表
+    var rawSpaceNames = formData.getAll("spaceNames") || [];
+    if (rawSpaceNames.length === 0 && formData.get("spaceName")) {
+      rawSpaceNames = [formData.get("spaceName")];
     }
 
     var results = [];
 
     for (var i = 0; i < files.length; i++) {
       var file = files[i];
-      // 跳过无效项（FormData 中可能出现字符串）
       if (!file || typeof file === "string") continue;
 
-      var spaceName = spaceNames[i] || "";
+      // 解析 spaceNames（可能是 JSON 数组字符串或普通字符串）
+      var raw = rawSpaceNames[i] || "";
+      var parsedNames = [];
+      try {
+        parsedNames = JSON.parse(raw);
+        if (!Array.isArray(parsedNames)) parsedNames = [raw];
+      } catch (_) {
+        parsedNames = raw ? [raw] : [];
+      }
+      parsedNames = parsedNames.filter(Boolean);
+
       console.log(
         "处理第" +
           (i + 1) +
@@ -528,10 +553,10 @@ export async function POST(req) {
           files.length +
           "张图片:",
         file.name,
-        "空间:" + (spaceName || "未指定")
+        "空间:" + (parsedNames.length > 0 ? parsedNames.join("、") : "未指定")
       );
 
-      var doc = await processFile(file, spaceName, i);
+      var doc = await processFile(file, parsedNames, i);
       results.push(doc);
     }
 
