@@ -1,24 +1,12 @@
 "use client";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import PreviewModal from "../components/PreviewModal";
 
 /** 常用空间名称预选项 */
 const PRESET_SPACES = [
-  "客厅",
-  "餐厅",
-  "主卧",
-  "次卧",
-  "书房",
-  "厨房",
-  "卫生间",
-  "玄关",
-  "阳台",
-  "衣帽间",
-  "儿童房",
-  "茶室",
-  "健身房",
-  "影音室",
+  "客厅", "餐厅", "主卧", "次卧", "书房", "厨房", "卫生间",
+  "玄关", "阳台", "衣帽间", "儿童房", "茶室", "健身房", "影音室",
 ];
 
 interface FileItem {
@@ -27,228 +15,264 @@ interface FileItem {
   spaceNames: string[];
 }
 
-interface UploadResult {
-  url: string;
-  mdUrl: string;
+interface JobResultItem {
   title: string;
-  summary: string;
+  mdUrl: string;
+  url: string;
   tags: string[];
-  spaceName: string;
-  spaceNames?: string[];
-  batchId?: string | number;
+  spaceNames: string[];
 }
 
 /**
- * 客户端图片压缩：若图片最大边 > maxPx，压缩为 JPEG 并缩放至 maxPx。
- * 否则返回原始 File 不变。
+ * 从 localStorage 加载最近项目名
  */
-/** 加载图片为 HTMLImageElement */
-function loadImage(src: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = reject;
-    img.src = src;
-  });
+function loadRecentProjects(): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    var raw = localStorage.getItem("recent_projects");
+    return raw ? JSON.parse(raw) : [];
+  } catch (_) {
+    return [];
+  }
 }
 
-async function compressIfNeeded(file: File, maxPx = 1600): Promise<File> {
-  // 非图片类型直接跳过
-  if (!file.type.startsWith("image/")) return file;
-
-  // 已经是 JPEG 且最大边不超过限制 → 无需处理
-  if (file.type === "image/jpeg") {
-    const dataUrl = URL.createObjectURL(file);
-    try {
-      const img = await loadImage(dataUrl);
-      if (Math.max(img.width, img.height) <= maxPx) return file;
-    } finally {
-      URL.revokeObjectURL(dataUrl);
-    }
-  }
-
-  // 非 JPEG（PNG/WebP 等）或需要压缩 → 统一转为 JPEG
-  const dataUrl = URL.createObjectURL(file);
+/**
+ * 保存项目名到 localStorage（最多保留 3 个不重复的）
+ */
+function saveRecentProject(name: string) {
+  if (!name || typeof window === "undefined") return;
   try {
-    const img = await loadImage(dataUrl);
-
-    const maxDim = Math.max(img.width, img.height);
-    const scale = maxDim > maxPx ? maxPx / maxDim : 1;
-    const w = Math.round(img.width * scale);
-    const h = Math.round(img.height * scale);
-
-    const canvas = document.createElement("canvas");
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext("2d") as CanvasRenderingContext2D;
-    ctx.drawImage(img, 0, 0, w, h);
-
-    const blob = await new Promise((resolve) => {
-      canvas.toBlob(resolve, "image/jpeg", 0.85);
-    }) as Blob | null;
-    if (!blob) return file;
-
-    const jpgName = file.name.replace(/\.[^.]+$/, ".jpg");
-    return new File([blob], jpgName, { type: "image/jpeg" });
-  } finally {
-    URL.revokeObjectURL(dataUrl);
-  }
+    var existing = loadRecentProjects();
+    var updated = [name].concat(existing.filter(function (n) { return n !== name; })).slice(0, 3);
+    localStorage.setItem("recent_projects", JSON.stringify(updated));
+  } catch (_) {}
 }
 
 export default function UploadPage() {
   const [fileItems, setFileItems] = useState<FileItem[]>([]);
   const [loading, setLoading] = useState(false);
-  const [results, setResults] = useState<UploadResult[]>([]);
+  const [results, setResults] = useState<JobResultItem[]>([]);
+  const [router] = useState(useRouter);
+
+  // ========== 项目名称 ==========
+  const [projectName, setProjectName] = useState("");
+  const [recentProjects, setRecentProjects] = useState<string[]>([]);
+
+  // ========== 任务状态 ==========
+  const [lastJobId, setLastJobId] = useState<string | null>(null);
+  const [jobStatus, setJobStatus] = useState<string>("");
+  const [jobProgress, setJobProgress] = useState({ total: 0, done: 0, failed: 0 });
+
+  // ========== 预览弹窗 ==========
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [previewType, setPreviewType] = useState<"image" | "markdown">(
-    "image"
-  );
+  const [previewType, setPreviewType] = useState<"image" | "markdown">("image");
   const [previewTitle, setPreviewTitle] = useState("");
   const [previewTags, setPreviewTags] = useState<string[]>([]);
   const [previewBatchId, setPreviewBatchId] = useState<string | number>("");
-  const router = useRouter();
 
-  // ========== 文件选择 ==========
-  const handleFileChange = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      const selectedFiles = Array.from(e.target.files || []);
-      if (selectedFiles.length === 0) return;
-
-      const newItems: FileItem[] = [];
-      let loadedCount = 0;
-
-      selectedFiles.forEach((file, index) => {
-        const reader = new FileReader();
-        reader.onload = (event) => {
-          newItems[index] = {
-            file,
-            preview: event.target?.result as string,
-            spaceNames: [],
-          };
-          loadedCount++;
-
-          if (loadedCount === selectedFiles.length) {
-            setFileItems((prev) => [...prev, ...newItems]);
-            setResults([]);
-            // 重置 file input 以便重复选择同一文件
-            e.target.value = "";
-          }
-        };
-        reader.readAsDataURL(file);
-      });
-    },
-    []
-  );
-
-  // ========== 删除文件 ==========
-  const removeFile = useCallback((index: number) => {
-    setFileItems((prev) => prev.filter((_, i) => i !== index));
+  // 初始化加载最近项目名
+  useEffect(function () {
+    setRecentProjects(loadRecentProjects());
   }, []);
 
-  // ========== 更新空间名称数组 ==========
-  const updateSpaceNames = useCallback(
-    (index: number, names: string[]) => {
-      setFileItems((prev) =>
-        prev.map((item, i) =>
-          i === index ? { ...item, spaceNames: names } : item
-        )
-      );
-    },
-    []
-  );
+  // 轮询任务状态
+  useEffect(function () {
+    if (!lastJobId) return;
+    var timer = setInterval(async function () {
+      try {
+        var res = await fetch("/api/jobs/status?jobId=" + lastJobId);
+        var data = await res.json();
+        if (data.success) {
+          setJobProgress({
+            total: data.data.totalImages || 0,
+            done: data.data.processed || 0,
+            failed: data.data.failed || 0,
+          });
+          if (data.data.status === "completed") {
+            setJobStatus("completed");
+            setResults(data.data.results || []);
+            clearInterval(timer);
+          } else if (data.data.status === "failed") {
+            setJobStatus("failed");
+            clearInterval(timer);
+          } else if (data.data.status === "processing") {
+            setJobStatus("processing");
+          }
+        }
+      } catch (_) {}
+    }, 3000);
+    return function () { clearInterval(timer); };
+  }, [lastJobId]);
+
+  // ========== 文件选择 ==========
+  const handleFileChange = useCallback(function (e: React.ChangeEvent<HTMLInputElement>) {
+    var selectedFiles = Array.from(e.target.files || []);
+    if (selectedFiles.length === 0) return;
+
+    var newItems: FileItem[] = [];
+    var loadedCount = 0;
+
+    selectedFiles.forEach(function (file, index) {
+      var reader = new FileReader();
+      reader.onload = function (event) {
+        newItems[index] = {
+          file: file,
+          preview: (event.target?.result as string) || "",
+          spaceNames: [],
+        };
+        loadedCount++;
+        if (loadedCount === selectedFiles.length) {
+          setFileItems(function (prev) { return prev.concat(newItems); });
+          setResults([]);
+          setLastJobId(null);
+          setJobStatus("");
+          e.target.value = "";
+        }
+      };
+      reader.readAsDataURL(file);
+    });
+  }, []);
+
+  // ========== 删除文件 ==========
+  const removeFile = useCallback(function (index: number) {
+    setFileItems(function (prev) { return prev.filter(function (_, i) { return i !== index; }); });
+  }, []);
+
+  // ========== 更新空间名称 ==========
+  const updateSpaceNames = useCallback(function (index: number, names: string[]) {
+    setFileItems(function (prev) {
+      return prev.map(function (item, i) {
+        return i === index ? { ...item, spaceNames: names } : item;
+      });
+    });
+  }, []);
 
   // ========== 预设按钮切换 ==========
-  const togglePreset = useCallback(
-    (index: number, preset: string) => {
-      setFileItems((prev) => {
-        const item = prev[index];
-        if (!item) return prev;
-        const exists = item.spaceNames.includes(preset);
-        const newNames = exists
-          ? item.spaceNames.filter((n) => n !== preset)
-          : [...item.spaceNames, preset];
-        return prev.map((it, i) =>
-          i === index ? { ...it, spaceNames: newNames } : it
-        );
+  const togglePreset = useCallback(function (index: number, preset: string) {
+    setFileItems(function (prev) {
+      var item = prev[index];
+      if (!item) return prev;
+      var exists = item.spaceNames.includes(preset);
+      var newNames = exists
+        ? item.spaceNames.filter(function (n) { return n !== preset; })
+        : item.spaceNames.concat([preset]);
+      return prev.map(function (it, i) {
+        return i === index ? { ...it, spaceNames: newNames } : it;
       });
-    },
-    []
-  );
+    });
+  }, []);
 
-  // ========== 上传所有图片 ==========
-  const handleUpload = async () => {
+  // ========== 上传（异步：先传文件到 COS，后台处理） ==========
+  const handleUpload = useCallback(async function (mode: "batch" | "individual") {
     if (fileItems.length === 0) return;
 
     setLoading(true);
     setResults([]);
+    setLastJobId(null);
+    setJobStatus("uploading");
+
+    // 保存项目名
+    if (projectName) {
+      saveRecentProject(projectName);
+      setRecentProjects(loadRecentProjects());
+    }
 
     try {
-      // 先压缩所有需要压缩的图片
-      const compressedItems = await Promise.all(
-        fileItems.map(async (item) => ({
-          file: await compressIfNeeded(item.file),
-          spaceNames: item.spaceNames,
-        }))
-      );
-
-      const formData = new FormData();
-      for (const item of compressedItems) {
-        formData.append("files", item.file);
-        formData.append("spaceNames", JSON.stringify(item.spaceNames));
+      // 直接上传原始文件（不压缩）
+      var formData = new FormData();
+      for (var i = 0; i < fileItems.length; i++) {
+        formData.append("files", fileItems[i].file);
+        formData.append("spaceNames", JSON.stringify(fileItems[i].spaceNames));
       }
+      formData.append("mode", mode);
+      formData.append("projectName", projectName);
 
-      const res = await fetch("/api/upload", {
-        method: "POST",
-        body: formData,
-      });
+      var res = await fetch("/api/upload", { method: "POST", body: formData });
+      var data = await res.json();
 
-      const data = await res.json();
       if (data.success) {
-        setResults(data.data || []);
+        setLastJobId(data.jobId);
+        setJobStatus("pending");
+        setJobProgress({ total: data.fileCount || 0, done: 0, failed: 0 });
         setFileItems([]);
       } else {
         alert("上传失败: " + (data.error || "未知错误"));
+        setJobStatus("");
       }
     } catch (err) {
       alert("上传失败，请重试");
       console.error(err);
+      setJobStatus("");
     } finally {
       setLoading(false);
     }
-  };
+  }, [fileItems, projectName]);
 
   // ========== 预览弹窗 ==========
-  const openPreview = useCallback(
-    (url: string, type: "image" | "markdown", title: string, tags?: string[], batchId?: string | number) => {
-      setPreviewUrl(url);
-      setPreviewType(type);
-      setPreviewTitle(title);
-      setPreviewTags(tags || []);
-      setPreviewBatchId(batchId || "");
-    },
-    []
-  );
+  const openPreview = useCallback(function (
+    url: string, type: "image" | "markdown", title: string,
+    tags?: string[], batchId?: string | number
+  ) {
+    setPreviewUrl(url);
+    setPreviewType(type);
+    setPreviewTitle(title);
+    setPreviewTags(tags || []);
+    setPreviewBatchId(batchId || "");
+  }, []);
 
-  const closePreview = useCallback(() => {
+  const closePreview = useCallback(function () {
     setPreviewUrl(null);
   }, []);
+
+  // 判断上传按钮是否可点
+  var canUpload = fileItems.length > 0 && !loading;
 
   return (
     <main className="min-h-screen bg-gray-50 p-4">
       <div className="max-w-3xl mx-auto">
-        {/* ========== 头部 ========== */}
         <div className="bg-white rounded-lg shadow-md p-6 mb-6">
           <div className="flex justify-between items-center mb-6">
             <h1 className="text-2xl font-bold">上传图片</h1>
-            <button
-              onClick={() => router.push("/")}
-              className="px-4 py-2 bg-gray-200 hover:bg-gray-300 rounded-lg transition-colors"
-            >
-              返回首页
-            </button>
+            <div className="flex gap-2">
+              <a href="/" className="px-4 py-2 bg-gray-200 hover:bg-gray-300 rounded-lg transition-colors">
+                返回首页
+              </a>
+              <a href="/admin" className="px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors">
+                管理后台
+              </a>
+            </div>
           </div>
 
-          {/* 文件选择 */}
+          {/* ===== 项目名称 ===== */}
+          <div className="mb-4">
+            <label className="block text-sm font-medium mb-1">项目名称（可选）</label>
+            <input
+              type="text"
+              placeholder="输入项目名称"
+              value={projectName}
+              onChange={function (e) { setProjectName(e.target.value); }}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            {recentProjects.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 mt-2">
+                {recentProjects.map(function (name) {
+                  return (
+                    <button
+                      key={name}
+                      type="button"
+                      onClick={function () { setProjectName(name); }}
+                      className="px-2.5 py-1 text-xs bg-gray-100 text-gray-600 rounded-full border border-gray-200 hover:bg-blue-50 hover:border-blue-300 transition-colors"
+                    >
+                      {name}
+                    </button>
+                  );
+                })}
+                <span className="text-xs text-gray-400 self-center ml-1">最近使用</span>
+              </div>
+            )}
+          </div>
+
+          {/* ===== 文件选择 ===== */}
           <div className="mb-4">
             <label className="block mb-2 font-medium">选择图片文件</label>
             <input
@@ -259,192 +283,178 @@ export default function UploadPage() {
               className="w-full p-2 border border-gray-300 rounded-lg"
             />
             <p className="text-xs text-gray-400 mt-1">
-              可同时选择多张图片。最大边超过 1600px 的图片将自动压缩。
+              可同时选择多张图片。文件先上传到服务器，压缩和分析在后台进行。
             </p>
           </div>
 
-          {/* 上传按钮 */}
-          {fileItems.length > 0 && (
+          {/* ===== 上传按钮 ===== */}
+          <div className="flex gap-3">
             <button
-              onClick={handleUpload}
-              disabled={loading}
-              className={`w-full py-3 rounded-lg font-medium transition-colors ${
-                loading
+              onClick={function () { handleUpload("individual"); }}
+              disabled={!canUpload}
+              className={"flex-1 py-3 rounded-lg font-medium transition-colors " + (
+                !canUpload
                   ? "bg-gray-300 text-gray-500 cursor-not-allowed"
                   : "bg-blue-500 text-white hover:bg-blue-600"
-              }`}
+              )}
             >
-              {loading
-                ? "正在压缩、上传并分析（" + fileItems.length + " 张）..."
-                : "上传 " + fileItems.length + " 张图片并分析"}
+              分张分析上传
             </button>
+            <button
+              onClick={function () { handleUpload("batch"); }}
+              disabled={!canUpload}
+              className={"flex-1 py-3 rounded-lg font-medium transition-colors " + (
+                !canUpload
+                  ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                  : "bg-green-500 text-white hover:bg-green-600"
+              )}
+            >
+              批量分析上传
+            </button>
+          </div>
+          <p className="text-xs text-gray-400 mt-2 text-center">
+            「分张」每张图分别分析、「批量」所有图一次分析（视 API 能力）
+          </p>
+
+          {/* ===== 任务状态 ===== */}
+          {jobStatus && jobStatus !== "" && (
+            <div className={"mt-4 p-4 rounded-lg border " + (
+              jobStatus === "completed" ? "bg-green-50 border-green-200" :
+              jobStatus === "failed" ? "bg-red-50 border-red-200" :
+              "bg-blue-50 border-blue-200"
+            )}>
+              <p className="font-medium">
+                {jobStatus === "uploading" && "⏳ 上传文件中..."}
+                {jobStatus === "pending" && "✅ 文件已上传，等待处理..."}
+                {jobStatus === "processing" && "🔄 分析中..."}
+                {jobStatus === "completed" && "✅ 处理完成！"}
+                {jobStatus === "failed" && "❌ 处理失败"}
+              </p>
+              {(jobStatus === "pending" || jobStatus === "processing") && jobProgress.total > 0 && (
+                <p className="text-sm text-gray-600 mt-1">
+                  进度：{jobProgress.done}/{jobProgress.total}
+                  {jobProgress.failed > 0 && " （" + jobProgress.failed + " 失败）"}
+                </p>
+              )}
+              {jobStatus === "pending" && (
+                <p className="text-xs text-gray-400 mt-1">
+                  任务编号：{lastJobId}（可关闭页面，之后在管理后台查看结果）
+                </p>
+              )}
+              {lastJobId && (
+                <button
+                  onClick={async function () {
+                    var res = await fetch("/api/process-queue");
+                    var data = await res.json();
+                    alert(data.message || "已触发处理");
+                  }}
+                  className="mt-2 px-3 py-1 text-xs bg-white border border-gray-300 rounded hover:bg-gray-50 transition-colors"
+                >
+                  手动触发处理
+                </button>
+              )}
+            </div>
           )}
         </div>
 
-        {/* ========== 文件列表 ========== */}
+        {/* ===== 文件列表 ===== */}
         {fileItems.length > 0 && (
           <div className="space-y-4">
-            {fileItems.map((item, index) => (
-              <div
-                key={index}
-                className="bg-white rounded-lg shadow-md p-4"
-              >
-                <div className="flex gap-4">
-                  {/* 缩略图 */}
-                  <div className="w-28 h-28 flex-shrink-0">
-                    <img
-                      src={item.preview}
-                      alt={item.file.name}
-                      className="w-full h-full object-cover rounded-lg border border-gray-200"
-                    />
-                  </div>
-
-                  <div className="flex-1 min-w-0">
-                    {/* 文件名 */}
-                    <p className="text-sm text-gray-500 mb-2 truncate">
-                      {item.file.name}
-                    </p>
-
-                    {/* 空间名称输入（显示所有已选名称，可编辑） */}
-                    <label className="block text-sm font-medium mb-1">
-                      空间名称
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="点击预设标签选择，或用顿号分隔多个自定义空间名"
-                      value={item.spaceNames.join("、")}
-                      onChange={(e) => {
-                        const names = e.target.value
-                          .split("、")
-                          .map((s) => s.trim())
-                          .filter(Boolean);
-                        updateSpaceNames(index, names);
-                      }}
-                      className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 mb-2"
-                    />
-
-                    {/* 预设空间名按钮（多选） */}
-                    <div className="flex flex-wrap gap-1.5 mb-2">
-                      {PRESET_SPACES.map((preset) => (
-                        <button
-                          key={preset}
-                          type="button"
-                          onClick={() => togglePreset(index, preset)}
-                          className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${
-                            item.spaceNames.includes(preset)
-                              ? "bg-blue-500 text-white border-blue-500"
-                              : "bg-gray-50 text-gray-600 border-gray-300 hover:bg-blue-50 hover:border-blue-300"
-                          }`}
-                        >
-                          {preset}
-                        </button>
-                      ))}
+            {fileItems.map(function (item, index) {
+              return (
+                <div key={index} className="bg-white rounded-lg shadow-md p-4">
+                  <div className="flex gap-4">
+                    <div className="w-28 h-28 flex-shrink-0">
+                      <img src={item.preview} alt={item.file.name}
+                        className="w-full h-full object-cover rounded-lg border border-gray-200" />
                     </div>
-
-                    {/* 已选空间名标签 */}
-                    {item.spaceNames.length > 0 && (
-                      <div className="flex flex-wrap gap-1">
-                        {item.spaceNames.map((name) => (
-                          <span
-                            key={name}
-                            className="inline-flex items-center gap-1 px-2 py-0.5 text-xs bg-blue-100 text-blue-700 rounded-full"
-                          >
-                            {name}
-                            <button
-                              onClick={() => {
-                                const newNames = item.spaceNames.filter(
-                                  (n) => n !== name
-                                );
-                                updateSpaceNames(index, newNames);
-                              }}
-                              className="text-blue-400 hover:text-blue-700 leading-none"
-                            >
-                              ×
-                            </button>
-                          </span>
-                        ))}
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm text-gray-500 mb-2 truncate">{item.file.name}</p>
+                      <label className="block text-sm font-medium mb-1">空间名称</label>
+                      <input
+                        type="text"
+                        placeholder="点击预设标签选择"
+                        value={item.spaceNames.join("、")}
+                        onChange={function (e) {
+                          var names = e.target.value.split("、").map(function (s) { return s.trim(); }).filter(Boolean);
+                          updateSpaceNames(index, names);
+                        }}
+                        className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 mb-2"
+                      />
+                      <div className="flex flex-wrap gap-1.5 mb-2">
+                        {PRESET_SPACES.map(function (preset) {
+                          return (
+                            <button key={preset} type="button" onClick={function () { togglePreset(index, preset); }}
+                              className={"px-2.5 py-1 text-xs rounded-full border transition-colors " + (
+                                item.spaceNames.includes(preset)
+                                  ? "bg-blue-500 text-white border-blue-500"
+                                  : "bg-gray-50 text-gray-600 border-gray-300 hover:bg-blue-50 hover:border-blue-300"
+                              )}
+                            >{preset}</button>
+                          );
+                        })}
                       </div>
-                    )}
+                      {item.spaceNames.length > 0 && (
+                        <div className="flex flex-wrap gap-1">
+                          {item.spaceNames.map(function (name) {
+                            return (
+                              <span key={name}
+                                className="inline-flex items-center gap-1 px-2 py-0.5 text-xs bg-blue-100 text-blue-700 rounded-full"
+                              >
+                                {name}
+                                <button onClick={function () {
+                                  updateSpaceNames(index, item.spaceNames.filter(function (n) { return n !== name; }));
+                                }} className="text-blue-400 hover:text-blue-700 leading-none">×</button>
+                              </span>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                    <button onClick={function () { removeFile(index); }}
+                      className="flex-shrink-0 self-start w-6 h-6 flex items-center justify-center text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-full transition-colors"
+                      title="移除此图片">✕</button>
                   </div>
-
-                  {/* 删除按钮 */}
-                  <button
-                    onClick={() => removeFile(index)}
-                    className="flex-shrink-0 self-start w-6 h-6 flex items-center justify-center text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-full transition-colors"
-                    title="移除此图片"
-                  >
-                    ✕
-                  </button>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
-        {/* ========== 上传结果列表 ========== */}
+        {/* ===== 处理结果 ===== */}
         {results.length > 0 && (
           <div className="mt-6 space-y-4">
-            <h2 className="text-xl font-bold">
-              上传结果（{results.length} 张）
-            </h2>
-            {results.map((result, index) => (
-              <div
-                key={index}
-                className="bg-green-50 border border-green-200 rounded-lg p-4"
-              >
-                <h3 className="font-semibold text-green-800 mb-2">
-                  图片 {index + 1}
-                  {result.spaceNames && result.spaceNames.length > 0
-                    ? " — " + result.spaceNames.join("、")
-                    : result.spaceName
-                    ? " — " + result.spaceName
-                    : ""}
-                </h3>
-                <p className="mb-1">
-                  <strong>标题:</strong> {result.title}
-                </p>
-                <p className="mb-1">
-                  <strong>总结:</strong> {result.summary}
-                </p>
-                <p className="mb-1">
-                  <strong>关键词:</strong>{" "}
-                  {result.tags?.join(", ") || "无"}
-                </p>
-                <div className="flex gap-2 mt-3">
-                  <button
-                    onClick={() =>
-                      openPreview(
-                        result.mdUrl,
-                        "markdown",
-                        result.title || "分析总结"
-                      )
-                    }
-                    className="px-3 py-1.5 text-sm bg-green-100 text-green-700 rounded hover:bg-green-200 transition-colors"
-                  >
-                    查看总结
-                  </button>
-                  <button
-                    onClick={() =>
-                      openPreview(
-                        result.url,
-                        "image",
-                        result.title || "原图",
-                        result.tags,
-                        result.batchId
-                      )
-                    }
-                    className="px-3 py-1.5 text-sm bg-blue-100 text-blue-700 rounded hover:bg-blue-200 transition-colors"
-                  >
-                    查看原图
-                  </button>
+            <h2 className="text-xl font-bold">处理结果（{results.length} 张）</h2>
+            {results.map(function (result, index) {
+              var spaceLabel = result.spaceNames && result.spaceNames.length > 0
+                ? result.spaceNames.join("、") : "";
+              return (
+                <div key={index} className="bg-green-50 border border-green-200 rounded-lg p-4">
+                  <h3 className="font-semibold text-green-800 mb-2">
+                    图片 {index + 1}{spaceLabel ? " — " + spaceLabel : ""}
+                  </h3>
+                  <p className="mb-1"><strong>标题:</strong> {result.title}</p>
+                  <p className="mb-1"><strong>关键词:</strong> {(result.tags || []).join(", ") || "无"}</p>
+                  <div className="flex gap-2 mt-3">
+                    <button onClick={function () {
+                      openPreview(result.mdUrl, "markdown", result.title || "分析总结");
+                    }} className="px-3 py-1.5 text-sm bg-green-100 text-green-700 rounded hover:bg-green-200 transition-colors">
+                      查看总结
+                    </button>
+                    <button onClick={function () {
+                      openPreview(result.url, "image", result.title || "原图", result.tags);
+                    }} className="px-3 py-1.5 text-sm bg-blue-100 text-blue-700 rounded hover:bg-blue-200 transition-colors">
+                      查看原图
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
 
-      {/* ========== 预览弹窗 ========== */}
+      {/* 预览弹窗 */}
       {previewUrl && (
         <PreviewModal
           url={previewUrl}
