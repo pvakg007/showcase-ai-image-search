@@ -84,8 +84,17 @@ export default function AdminPage() {
   // ========== AI 设置 ==========
   var [aiUrl, setAiUrl] = useState("");
   var [aiModel, setAiModel] = useState("");
+  var [aiPrompt, setAiPrompt] = useState("");
   var [settingsLoading, setSettingsLoading] = useState(false);
   var [settingsMsg, setSettingsMsg] = useState("");
+
+  // ========== 任务管理 ==========
+  var [jobList, setJobList] = useState<any[]>([]);
+  var [jobListLoading, setJobListLoading] = useState(false);
+  var [jobFilter, setJobFilter] = useState("");
+
+  // ========== 重新分析 ==========
+  var [reprocessingId, setReprocessingId] = useState<number | null>(null);
 
   var loadSettings = useCallback(async () => {
     setSettingsLoading(true);
@@ -93,6 +102,7 @@ export default function AdminPage() {
     if (result.success && result.data) {
       setAiUrl(result.data.aiUrl || "");
       setAiModel(result.data.aiModel || "");
+      setAiPrompt(result.data.aiPrompt || "");
     }
     setSettingsLoading(false);
   }, []);
@@ -101,18 +111,21 @@ export default function AdminPage() {
     setSettingsMsg("");
     var result = await adminFetch("/api/admin/settings", {
       method: "PUT",
-      body: JSON.stringify({ aiUrl, aiModel }),
+      body: JSON.stringify({ aiUrl, aiModel, aiPrompt }),
     });
     if (result.success) {
       setSettingsMsg("✅ " + (result.message || "已保存"));
     } else {
       setSettingsMsg("❌ " + (result.error || "保存失败"));
     }
-  }, [aiUrl, aiModel]);
+  }, [aiUrl, aiModel, aiPrompt]);
 
-  // 认证后加载设置
+  // 认证后加载设置 + 任务列表
   useEffect(() => {
-    if (authenticated) loadSettings();
+    if (authenticated) {
+      loadSettings();
+      loadJobList();
+    }
   }, [authenticated, loadSettings]);
 
   // ========== 首次设置 ==========
@@ -185,6 +198,63 @@ export default function AdminPage() {
     if (result.success) {
       setStats(result.data);
     }
+  }, []);
+
+  // ========== 任务管理 ==========
+  var loadJobList = useCallback(async (status?: string) => {
+    setJobListLoading(true);
+    var params = new URLSearchParams();
+    params.set("limit", "50");
+    if (status) params.set("status", status);
+    var result = await adminFetch("/api/jobs/list?" + params.toString());
+    if (result.success) {
+      setJobList(result.data || []);
+    }
+    setJobListLoading(false);
+  }, []);
+
+  var retryJob = useCallback(async (jobId: string) => {
+    var result = await adminFetch("/api/jobs/retry", {
+      method: "POST",
+      body: JSON.stringify({ jobId }),
+    });
+    if (result.success) {
+      loadJobList(jobFilter);
+    } else {
+      alert("重试失败: " + (result.error || "未知错误"));
+    }
+  }, [jobFilter]);
+
+  // ========== 重新分析 ==========
+  var handleReprocess = useCallback(async (item: ImageItem) => {
+    setReprocessingId(item.id);
+    var result = await adminFetch("/api/jobs/reprocess", {
+      method: "POST",
+      body: JSON.stringify({
+        id: item.id,
+        url: item.url,
+        mdUrl: item.mdUrl,
+      }),
+    });
+    if (result.success && result.data) {
+      setImages(function (prev) {
+        return prev.map(function (img) {
+          if (img.id === item.id) {
+            return {
+              ...img,
+              title: result.data.title || img.title,
+              summary: result.data.summary || img.summary,
+              tags: result.data.tags || img.tags,
+              mdUrl: result.data.mdUrl || img.mdUrl,
+            };
+          }
+          return img;
+        });
+      });
+    } else {
+      alert("重新分析失败: " + (result.error || "未知错误"));
+    }
+    setReprocessingId(null);
   }, []);
 
   // ========== 编辑 ==========
@@ -466,6 +536,16 @@ export default function AdminPage() {
                 placeholder="qwen3.6-plus"
               />
             </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1">自定义提示词（可选，覆盖默认提示词）</label>
+              <textarea
+                value={aiPrompt}
+                onChange={(e) => setAiPrompt(e.target.value)}
+                rows={4}
+                className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono resize-y"
+                placeholder="留空则使用默认提示词（提示词.txt）"
+              />
+            </div>
             <div className="flex items-center gap-3">
               <button
                 onClick={saveSettings}
@@ -478,6 +558,94 @@ export default function AdminPage() {
                 <span className="text-sm">{settingsMsg}</span>
               )}
             </div>
+          </div>
+        </details>
+
+        {/* ===== 任务管理 ===== */}
+        <details className="bg-white rounded-lg shadow-sm mb-4">
+          <summary className="px-4 py-3 cursor-pointer font-medium text-sm text-gray-700 hover:bg-gray-50 rounded-lg select-none">
+            📋 任务管理
+          </summary>
+          <div className="px-4 pb-4 border-t border-gray-100 pt-3">
+            <div className="flex gap-2 mb-3 flex-wrap">
+              {[
+                { key: "", label: "全部" },
+                { key: "pending", label: "等待中" },
+                { key: "processing", label: "处理中" },
+                { key: "completed", label: "已完成" },
+                { key: "failed", label: "失败" },
+              ].map(function (s) {
+                return (
+                  <button
+                    key={s.key}
+                    onClick={function () { setJobFilter(s.key); loadJobList(s.key); }}
+                    className={"px-3 py-1 text-xs rounded-full border transition-colors " + (
+                      jobFilter === s.key
+                        ? "bg-blue-500 text-white border-blue-500"
+                        : "bg-gray-50 text-gray-600 border-gray-300 hover:bg-blue-50"
+                    )}
+                  >
+                    {s.label}
+                  </button>
+                );
+              })}
+              <button
+                onClick={function () { loadJobList(jobFilter); }}
+                className="px-3 py-1 text-xs bg-gray-100 text-gray-600 rounded hover:bg-gray-200 transition-colors ml-auto"
+              >
+                刷新
+              </button>
+            </div>
+
+            {jobListLoading ? (
+              <div className="text-center py-8 text-gray-400 text-sm">加载中...</div>
+            ) : jobList.length === 0 ? (
+              <div className="text-center py-8 text-gray-400 text-sm">暂无任务</div>
+            ) : (
+              <div className="space-y-2 max-h-96 overflow-y-auto">
+                {jobList.map(function (job: any) {
+                  var statusColor =
+                    job.status === "completed" ? "text-green-600 bg-green-50" :
+                    job.status === "failed" ? "text-red-600 bg-red-50" :
+                    job.status === "processing" ? "text-blue-600 bg-blue-50" :
+                    "text-yellow-600 bg-yellow-50";
+                  var statusLabel =
+                    job.status === "completed" ? "已完成" :
+                    job.status === "failed" ? "失败" :
+                    job.status === "processing" ? "处理中" :
+                    job.status === "pending" ? "等待中" : "重试中";
+                  return (
+                    <div key={job.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg text-sm">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className={"px-2 py-0.5 rounded text-xs font-medium " + statusColor}>
+                            {statusLabel}
+                          </span>
+                          <span className="font-medium truncate">{job.projectName || job.id.substring(job.id.length - 8)}</span>
+                          <span className="text-gray-400 text-xs">{job.type}</span>
+                        </div>
+                        <div className="text-gray-500 text-xs mt-1">
+                          {job.processed}/{job.totalImages} 处理完成
+                          {job.failed > 0 ? "（" + job.failed + " 失败）" : ""}
+                          {job.retryCount > 0 ? " · 重试 " + job.retryCount + "/" + job.maxRetries : ""}
+                          <span className="ml-2">{formatTime(job.createdAt)}</span>
+                        </div>
+                      </div>
+                      <div className="flex gap-1 flex-shrink-0 ml-2">
+                        {job.status === "failed" && (
+                          <button
+                            onClick={function () { retryJob(job.id); }}
+                            className="px-2.5 py-1 text-xs bg-red-100 text-red-700 rounded hover:bg-red-200 transition-colors"
+                          >
+                            重试
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </details>
 
@@ -566,6 +734,17 @@ export default function AdminPage() {
                         className="px-3 py-1 text-xs bg-gray-100 text-gray-600 rounded hover:bg-gray-200 transition-colors"
                       >
                         查看总结
+                      </button>
+                      <button
+                        onClick={() => handleReprocess(item)}
+                        disabled={reprocessingId === item.id}
+                        className={"px-3 py-1 text-xs rounded transition-colors " + (
+                          reprocessingId === item.id
+                            ? "bg-gray-100 text-gray-400 cursor-not-allowed"
+                            : "bg-orange-100 text-orange-700 hover:bg-orange-200"
+                        )}
+                      >
+                        {reprocessingId === item.id ? "分析中..." : "重新分析"}
                       </button>
                       <button
                         onClick={() => handleDelete(item)}

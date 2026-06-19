@@ -94,6 +94,7 @@ export async function POST(req) {
       retryCount: 0,
       maxRetries: 2,
       nextRetryAt: null,
+      processingLock: 0,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
@@ -119,7 +120,7 @@ export async function POST(req) {
         process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/settings",
         {
           searchableAttributes: ["id"],
-          filterableAttributes: ["status", "retryCount", "maxRetries"],
+          filterableAttributes: ["status", "retryCount", "maxRetries", "processingLock"],
           sortableAttributes: ["createdAt"],
         },
         {

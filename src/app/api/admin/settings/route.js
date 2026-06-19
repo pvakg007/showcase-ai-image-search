@@ -94,6 +94,7 @@ export async function GET(req) {
       data: {
         aiUrl: settings.aiUrl || process.env.SPARK_API_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1",
         aiModel: settings.aiModel || process.env.SPARK_MODEL || "qwen3.6-plus",
+        aiPrompt: settings.aiPrompt || "",
         envUrl: process.env.SPARK_API_URL || "",
         envModel: process.env.SPARK_MODEL || "",
       },
@@ -117,6 +118,7 @@ export async function PUT(req) {
     var updates = {};
     if (body.aiUrl !== undefined) updates.aiUrl = body.aiUrl.replace(/\/+$/, "").replace("/chat/completions", "");
     if (body.aiModel !== undefined) updates.aiModel = body.aiModel.trim();
+    if (body.aiPrompt !== undefined) updates.aiPrompt = body.aiPrompt.trim();
 
     var current = await readSettings();
     var merged = { ...current, ...updates };

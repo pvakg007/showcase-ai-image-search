@@ -178,8 +178,34 @@ function extractKey(url) {
 }
 
 /**
- * 处理单张图片：压缩 → AI 分析 → 保存结果
+ * 读取 AI 设置（COS config/ai-settings.json）+ 环境变量
+ * 返回 { aiUrl, aiModel, aiKey, aiPrompt }
  */
+async function readAiSettings() {
+  var aiUrl = process.env.SPARK_API_URL || "";
+  var aiModel = process.env.SPARK_MODEL || "qwen3.6-plus";
+  var aiKey = process.env.SPARK_API_KEY || process.env.DASHSCOPE_API_KEY || "";
+  var aiPrompt = "";
+  try {
+    var configData = await new Promise(function (resolve, reject) {
+      cos.getObject({
+        Bucket: process.env.COS_BUCKET,
+        Region: process.env.COS_REGION,
+        Key: "config/ai-settings.json",
+      }, function (err, d) { if (err) reject(err); else resolve(d); });
+    });
+    var configBody = Buffer.isBuffer(configData.Body) ? configData.Body : Buffer.from(configData.Body);
+    var settings = JSON.parse(configBody.toString("utf-8"));
+    if (settings.aiUrl) aiUrl = settings.aiUrl;
+    if (settings.aiModel) aiModel = settings.aiModel;
+    if (settings.aiPrompt) aiPrompt = settings.aiPrompt;
+  } catch (_) {}
+  return { aiUrl: aiUrl, aiModel: aiModel, aiKey: aiKey, aiPrompt: aiPrompt };
+}
+
+// ============================================================
+// 处理单张图片
+// ============================================================
 async function processSingleImage(fileInfo, index, promptContent, batchId) {
   var result = { imageIndex: index, status: "pending", error: "", spaceNames: fileInfo.spaceNames || [] };
   var cosKey = fileInfo.cosKey;
@@ -229,43 +255,25 @@ async function processSingleImage(fileInfo, index, promptContent, batchId) {
 
     var promptForImage = "图 " + (index + 1) + "：" + spaceLabel + "\n\n" + promptContent;
 
-    // 4. 调用 AI API（智能识别多种格式）
+    // 4. 调用 AI API
     console.log("[process] AI 分析:", compressedKey);
     var base64Image = compressed.toString("base64");
     var analysisRaw = "";
     var analysis = null;
 
-    // 先尝试从 COS 读取 AI 设置，再回退到环境变量
-    var aiUrl = process.env.SPARK_API_URL || "";
-    var aiModel = process.env.SPARK_MODEL || "qwen3.6-plus";
-    var aiKey = process.env.SPARK_API_KEY || process.env.DASHSCOPE_API_KEY || "";
-    try {
-      var configData = await new Promise(function (resolve, reject) {
-        cos.getObject({
-          Bucket: process.env.COS_BUCKET,
-          Region: process.env.COS_REGION,
-          Key: "config/ai-settings.json",
-        }, function (err, d) { if (err) reject(err); else resolve(d); });
-      });
-      var configBody = Buffer.isBuffer(configData.Body) ? configData.Body : Buffer.from(configData.Body);
-      var settings = JSON.parse(configBody.toString("utf-8"));
-      if (settings.aiUrl) aiUrl = settings.aiUrl;
-      if (settings.aiModel) aiModel = settings.aiModel;
-    } catch (_) {}
+    var aiSettings = await readAiSettings();
 
-    // ========== 多 URL 兜底列表（按测试结果排序） ==========
-    // 已确认有效的 URL + OpenAI 格式
+    // ========== 多 URL 兜底列表 ==========
     var FALLBACK_URLS = [
-      aiUrl,  // 用户配置/环境变量中的 URL（优先）
+      aiSettings.aiUrl,
       "https://llm-28jx4qmqak31ymc9.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
       "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
       "https://ws-zwf60r4eps2lu9v2.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1",
     ].filter(function (u) { return u && u.length > 0; });
 
-    // OpenAI Chat 格式（已确认可用）— 带图片
-    var openaiBodyWithImage = {
-      model: aiModel, max_tokens: 4096,
+    var openaiBody = {
+      model: aiSettings.aiModel, max_tokens: 4096,
       messages: [{
         role: "user",
         content: [
@@ -274,35 +282,26 @@ async function processSingleImage(fileInfo, index, promptContent, batchId) {
         ],
       }],
     };
-    // 纯文本兜底（某些模型不支持图片）
-    var openaiBodyTextOnly = {
-      model: aiModel, max_tokens: 4096,
-      messages: [{
-        role: "user",
-        content: promptForImage,
-      }],
-    };
-    var openaiHeadersDual = {
+
+    var openaiHeaders = {
       "Content-Type": "application/json",
-      "Authorization": "Bearer " + aiKey,
-      "x-dashscope-api-key": aiKey,
+      "Authorization": "Bearer " + aiSettings.aiKey,
+      "x-dashscope-api-key": aiSettings.aiKey,
     };
 
-    var sparkRes = null;
     var lastErrMsg = "";
-    var AI_TIMEOUT_FIRST = 25000; // 第一轮(带图片)每URL 25s，快速跳过慢节点
-    var AI_TIMEOUT_SECOND = 40000; // 第二轮(纯文本) 40s，比带图片快
+    var AI_TIMEOUT = 25000; // 每 URL 25s
 
-    // ========== 第一轮：带图片的 OpenAI 格式，遍历多个 URL ==========
+    // ========== 带图片的 OpenAI 格式，遍历多个 URL ==========
     for (var u = 0; u < FALLBACK_URLS.length && !analysisRaw; u++) {
       var baseUrl = FALLBACK_URLS[u].replace(/\/+$/, "");
       var chatUrl = baseUrl.indexOf("/chat/completions") === -1
         ? baseUrl + "/chat/completions" : baseUrl;
 
       try {
-        console.log("[AI] 尝试 URL" + (u + 1) + " 带图片: " + chatUrl);
-        sparkRes = await axios.post(chatUrl, openaiBodyWithImage, {
-          headers: openaiHeadersDual, timeout: AI_TIMEOUT_FIRST,
+        console.log("[AI] 尝试 URL" + (u + 1) + ": " + chatUrl);
+        var sparkRes = await axios.post(chatUrl, openaiBody, {
+          headers: openaiHeaders, timeout: AI_TIMEOUT,
         });
         if (sparkRes && sparkRes.status < 500) {
           var rd = sparkRes.data;
@@ -310,61 +309,22 @@ async function processSingleImage(fileInfo, index, promptContent, batchId) {
             analysisRaw = rd.choices[0].message.content;
             break;
           }
-          // Anthropic 格式响应（极低概率但保留）
           if (rd && rd.content && rd.content[0] && rd.content[0].text) {
             analysisRaw = rd.content[0].text;
             break;
           }
           if (rd && rd.error && rd.error.message) {
-            lastErrMsg = "[URL" + (u + 1) + " 带图片] API 返回错误: " + rd.error.message;
+            lastErrMsg = "[URL" + (u + 1) + "] API 返回错误: " + rd.error.message;
           } else {
-            lastErrMsg = "[URL" + (u + 1) + " 带图片] 响应格式无法识别: " + JSON.stringify(rd).substring(0, 200);
+            lastErrMsg = "[URL" + (u + 1) + "] 响应格式无法识别: " + JSON.stringify(rd).substring(0, 200);
           }
         }
       } catch (err) {
         var statusCode = err.response?.status || 0;
         var msg = err.response?.data?.error?.message || err.response?.data?.message || err.message || "未知错误";
-        lastErrMsg = "[URL" + (u + 1) + " 带图片] " + msg;
+        lastErrMsg = "[URL" + (u + 1) + "] " + msg;
         console.warn("[AI] " + lastErrMsg);
-        if (statusCode === 401 || statusCode === 403) break; // 认证错误直接终止
-      }
-    }
-
-    // ========== 第二轮：如果带图片失败，尝试纯文本 ==========
-    if (!analysisRaw) {
-      for (var u2 = 0; u2 < FALLBACK_URLS.length && !analysisRaw; u2++) {
-        var baseUrl2 = FALLBACK_URLS[u2].replace(/\/+$/, "");
-        var chatUrl2 = baseUrl2.indexOf("/chat/completions") === -1
-          ? baseUrl2 + "/chat/completions" : baseUrl2;
-
-        try {
-          console.log("[AI] 尝试 URL" + (u2 + 1) + " 纯文本: " + chatUrl2);
-          sparkRes = await axios.post(chatUrl2, openaiBodyTextOnly, {
-            headers: openaiHeadersDual, timeout: AI_TIMEOUT_SECOND,
-          });
-          if (sparkRes && sparkRes.status < 500) {
-            var rd2 = sparkRes.data;
-            if (rd2 && rd2.choices && rd2.choices[0] && rd2.choices[0].message && rd2.choices[0].message.content) {
-              analysisRaw = rd2.choices[0].message.content;
-              break;
-            }
-            if (rd2 && rd2.content && rd2.content[0] && rd2.content[0].text) {
-              analysisRaw = rd2.content[0].text;
-              break;
-            }
-            if (rd2 && rd2.error && rd2.error.message) {
-              lastErrMsg = "[URL" + (u2 + 1) + " 纯文本] API 返回错误: " + rd2.error.message;
-            } else {
-              lastErrMsg = "[URL" + (u2 + 1) + " 纯文本] 响应格式无法识别: " + JSON.stringify(rd2).substring(0, 200);
-            }
-          }
-        } catch (err) {
-          var statusCode2 = err.response?.status || 0;
-          var msg2 = err.response?.data?.error?.message || err.response?.data?.message || err.message || "未知错误";
-          lastErrMsg = "[URL" + (u2 + 1) + " 纯文本] " + msg2;
-          console.warn("[AI] " + lastErrMsg);
-          if (statusCode2 === 401 || statusCode2 === 403) break;
-        }
+        if (statusCode === 401 || statusCode === 403) break;
       }
     }
 
@@ -378,7 +338,6 @@ async function processSingleImage(fileInfo, index, promptContent, batchId) {
       analysisRaw = lastErrMsg;
     }
 
-    // AI 失败时将错误信息展示给用户
     var searchFields;
     if (!analysis && lastErrMsg) {
       searchFields = { title: "AI 分析失败", summary: "错误: " + lastErrMsg.substring(0, 300), tags: [] };
@@ -391,7 +350,7 @@ async function processSingleImage(fileInfo, index, promptContent, batchId) {
     var mdContent = buildMarkdown(analysis, imageUrl, timestamp, fileInfo.spaceNames);
     var mdFilename = "summaries/" + timestamp + "-" + path.basename(compressedKey).replace(/\.[^.]+$/, "") + ".md";
 
-    var mdResult = await new Promise(function (resolve, reject) {
+    await new Promise(function (resolve, reject) {
       cos.putObject({
         Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION,
         Key: mdFilename, Body: Buffer.from(mdContent, "utf-8"),
@@ -438,126 +397,229 @@ async function processSingleImage(fileInfo, index, promptContent, batchId) {
 }
 
 // ============================================================
-// 主入口：处理待处理队列
+// Meilisearch 辅助函数
+// ============================================================
+
+async function searchJobs(params) {
+  var res = await axios.post(
+    process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/search",
+    params,
+    { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
+  );
+  return res.data.hits || [];
+}
+
+async function updateJob(jobId, fields) {
+  await axios.post(
+    process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/documents",
+    [{ id: jobId, ...fields }],
+    { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
+  );
+}
+
+// ============================================================
+// 自链机制：fire-and-forget 调用自身
+// ============================================================
+function selfChain() {
+  try {
+    var baseUrl = process.env.VERCEL_URL
+      ? "https://" + process.env.VERCEL_URL
+      : (process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000");
+    fetch(baseUrl + "/api/process-queue", {
+      method: "GET",
+      headers: { "x-api-key": "internal" },
+    }).catch(function () {});
+  } catch (_) {}
+}
+
+// ============================================================
+// 恢复卡住的任务（processing 状态 > 5 分钟）
+// ============================================================
+async function recoverStuckJobs() {
+  try {
+    var cutoff = Date.now() - 5 * 60 * 1000;
+    var stuckHits = await searchJobs({
+      q: "",
+      filter: 'status = "processing" AND processingLock < ' + cutoff,
+      limit: 10,
+      sort: ["createdAt:asc"],
+    });
+    for (var j of stuckHits) {
+      console.log("[recovery] 恢复卡住的任务:", j.id);
+      // 重置为 pending，清除 processingLock，以便重新处理
+      await updateJob(j.id, {
+        status: "pending",
+        processingLock: 0,
+        updatedAt: Date.now(),
+      });
+    }
+  } catch (_) {}
+}
+
+// ============================================================
+// 查找下一个可处理的任务
+// ============================================================
+async function findNextJob() {
+  // 1. 优先 pending 任务
+  var hits = await searchJobs({
+    q: "",
+    filter: 'status = "pending"',
+    limit: 1,
+    sort: ["createdAt:asc"],
+  });
+  if (hits.length > 0) return hits[0];
+
+  // 2. 可重试的失败任务（状态为 failed，且 retryCount < maxRetries，且 nextRetryAt <= now）
+  var retryHits = await searchJobs({
+    q: "",
+    filter: 'status = "failed" AND retryCount < maxRetries',
+    limit: 5,
+    sort: ["nextRetryAt:asc"],
+  });
+  var now = Date.now();
+  for (var j of retryHits) {
+    if ((j.nextRetryAt || 0) <= now) return j;
+  }
+
+  return null;
+}
+
+// ============================================================
+// 确定任务最终状态并更新
+// ============================================================
+async function finalizeJob(job, results) {
+  var allSuccess = results.every(function (r) { return r && r.status === "success"; });
+  var jobId = job.id;
+
+  if (allSuccess) {
+    await updateJob(jobId, {
+      status: "completed",
+      results: results,
+      processingLock: 0,
+      updatedAt: Date.now(),
+    });
+  } else {
+    var retryCount = (job.retryCount || 0) + 1;
+    var maxRetries = job.maxRetries || 2;
+    if (retryCount >= maxRetries) {
+      await updateJob(jobId, {
+        status: "failed",
+        retryCount: retryCount,
+        results: results,
+        processingLock: 0,
+        updatedAt: Date.now(),
+      });
+    } else {
+      var nextRetryAt = Date.now() + 5 * 60 * 1000;
+      await updateJob(jobId, {
+        status: "failed",
+        retryCount: retryCount,
+        nextRetryAt: nextRetryAt,
+        results: results,
+        processingLock: 0,
+        updatedAt: Date.now(),
+      });
+    }
+  }
+}
+
+// ============================================================
+// 读取提示词（优先从 AI 设置中的 aiPrompt，再文件，再内嵌）
+// ============================================================
+async function readPrompt() {
+  var aiSettings = await readAiSettings();
+  if (aiSettings.aiPrompt && aiSettings.aiPrompt.trim()) {
+    console.log("[prompt] 使用自定义提示词（admin 设置）");
+    return aiSettings.aiPrompt;
+  }
+  try {
+    var filePrompt = fs.readFileSync(path.join(process.cwd(), "提示词.txt"), "utf-8");
+    if (filePrompt && filePrompt.trim()) {
+      console.log("[prompt] 使用提示词.txt");
+      return filePrompt;
+    }
+  } catch (_) {}
+  console.log("[prompt] 使用内嵌默认提示词");
+  return EMBEDDED_PROMPT;
+}
+
+// ============================================================
+// 主入口：单图自链处理
 // ============================================================
 export async function GET(req) {
-  var bucket = process.env.COS_BUCKET;
-  var region = process.env.COS_REGION;
-
   try {
-    // 1. 查下一个 pending 任务
-    var searchRes = await axios.post(
-      process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/search",
-      { q: "", filter: 'status = "pending"', limit: 1, sort: ["createdAt:asc"] },
-      { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
-    );
+    // ---- Phase 0: 恢复所有卡住的任务 (> 5min) ----
+    await recoverStuckJobs();
 
-    var hits = searchRes.data.hits || [];
-    if (hits.length === 0) {
-      var retryRes = await axios.post(
-        process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/search",
-        { q: "", filter: 'status = "failed" AND retryCount < maxRetries', limit: 1, sort: ["nextRetryAt:asc"] },
-        { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
-      );
-      hits = retryRes.data.hits || [];
-      if (hits.length > 0) {
-        var now = Date.now();
-        hits = hits.filter(function (j) { return (j.nextRetryAt || 0) <= now; });
-        if (hits.length === 0) {
-          return Response.json({ success: true, message: "暂无可处理的任务" });
-        }
-      }
-    }
-
-    if (hits.length === 0) {
+    // ---- Phase 1: 查找下一个可处理的任务 ----
+    var job = await findNextJob();
+    if (!job) {
       return Response.json({ success: true, message: "暂无可处理的任务" });
     }
 
-    var job = hits[0];
     var jobId = job.id;
-
-    // 2. 锁定任务
-    await axios.post(
-      process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/documents",
-      [{ id: jobId, status: "processing", updatedAt: Date.now() }],
-      { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
-    );
-
-    // 3. 读取提示词
-    var promptContent = "";
-    try {
-      promptContent = fs.readFileSync(path.join(process.cwd(), "提示词.txt"), "utf-8");
-    } catch (_) {
-      promptContent = EMBEDDED_PROMPT;
-    }
-
     var files = job.files || [];
     var results = (job.results || []).slice();
-    var allSuccess = true;
 
-    // 4. 处理图片
-    if (job.type === "batch") {
-      for (var fi = 0; fi < files.length; fi++) {
-        if (results[fi] && results[fi].status === "success") continue;
-        var r = await processSingleImage(files[fi], fi, promptContent, jobId);
-        results[fi] = r;
-        if (r.status !== "success") allSuccess = false;
+    // ---- Phase 2: 锁定任务 ----
+    // 记录 processingLock 时间戳，用于 stuck 检测
+    await updateJob(jobId, {
+      status: "processing",
+      processingLock: Date.now(),
+      updatedAt: Date.now(),
+    });
 
-        await axios.post(
-          process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/documents",
-          [{ id: jobId, results: results, updatedAt: Date.now() }],
-          { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
-        );
-      }
-    } else {
-      for (var fi2 = 0; fi2 < files.length; fi2++) {
-        if (results[fi2] && results[fi2].status === "success") continue;
-        var r2 = await processSingleImage(files[fi2], fi2, promptContent, jobId);
-        results[fi2] = r2;
-        if (r2.status !== "success") allSuccess = false;
-
-        await axios.post(
-          process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/documents",
-          [{ id: jobId, results: results, updatedAt: Date.now() }],
-          { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
-        );
+    // ---- Phase 3: 查找第一张未处理的图片 ----
+    var nextIndex = -1;
+    for (var i = 0; i < files.length; i++) {
+      if (!results[i] || results[i].status !== "success") {
+        nextIndex = i;
+        break;
       }
     }
 
-    // 5. 更新最终状态
-    if (allSuccess) {
-      await axios.post(
-        process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/documents",
-        [{ id: jobId, status: "completed", results: results, updatedAt: Date.now() }],
-        { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
-      );
-    } else {
-      var retryCount = (job.retryCount || 0) + 1;
-      var maxRetries = job.maxRetries || 2;
-      if (retryCount >= maxRetries) {
-        await axios.post(
-          process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/documents",
-          [{ id: jobId, status: "failed", retryCount: retryCount, results: results, updatedAt: Date.now() }],
-          { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
-        );
-      } else {
-        var nextRetryAt = Date.now() + 5 * 60 * 1000;
-        await axios.post(
-          process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/documents",
-          [{ id: jobId, status: "failed", retryCount: retryCount, nextRetryAt: nextRetryAt, results: results, updatedAt: Date.now() }],
-          { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
-        );
-      }
+    if (nextIndex === -1) {
+      // 所有图片已由其它调用完成
+      await finalizeJob(job, results);
+      return Response.json({ success: true, message: "所有图片已处理完毕" });
     }
 
+    // ---- Phase 4: 读取提示词 ----
+    var promptContent = await readPrompt();
+
+    // ---- Phase 5: 处理这张图片 ----
+    console.log("[process-queue] 处理任务", jobId, "图片", nextIndex + 1, "/", files.length);
+    var result = await processSingleImage(files[nextIndex], nextIndex, promptContent, jobId);
+    results[nextIndex] = result;
+
+    // ---- Phase 6: 保存进度 ----
+    var allDone = results.every(function (r) { return r && r.status && r.status !== "pending"; });
+    if (allDone) {
+      await finalizeJob(job, results);
+    } else {
+      await updateJob(jobId, {
+        results: results,
+        status: "processing",
+        processingLock: Date.now(),
+        updatedAt: Date.now(),
+      });
+    }
+
+    // ---- Phase 7: 自链（还有更多图片要处理） ----
+    if (!allDone) {
+      selfChain();
+    }
+
+    // ---- Phase 8: 返回结果 ----
     var successCount = results.filter(function (r) { return r && r.status === "success"; }).length;
     var failCount = results.filter(function (r) { return r && r.status === "failed"; }).length;
 
     return Response.json({
       success: true,
-      message: "处理完成：" + successCount + " 成功，" + failCount + " 失败",
+      message: "已完成 " + (nextIndex + 1) + "/" + files.length + "：" + successCount + " 成功，" + failCount + " 失败",
       jobId: jobId,
-      results: results,
+      result: result,
+      allDone: !!allDone,
     });
   } catch (err) {
     console.error("队列处理失败:", err.message);
