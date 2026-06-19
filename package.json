@@ -7,7 +7,6 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@next/swc-win32-x64-msvc": "^16.2.9",
     "axios": "^1.18.0",
     "cos-nodejs-sdk-v5": "^2.15.4",
     "next": "^14.2.29",
