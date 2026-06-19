@@ -35,6 +35,7 @@ interface UploadResult {
   tags: string[];
   spaceName: string;
   spaceNames?: string[];
+  batchId?: string | number;
 }
 
 /**
@@ -103,6 +104,8 @@ export default function UploadPage() {
     "image"
   );
   const [previewTitle, setPreviewTitle] = useState("");
+  const [previewTags, setPreviewTags] = useState<string[]>([]);
+  const [previewBatchId, setPreviewBatchId] = useState<string | number>("");
   const router = useRouter();
 
   // ========== 文件选择 ==========
@@ -216,10 +219,12 @@ export default function UploadPage() {
 
   // ========== 预览弹窗 ==========
   const openPreview = useCallback(
-    (url: string, type: "image" | "markdown", title: string) => {
+    (url: string, type: "image" | "markdown", title: string, tags?: string[], batchId?: string | number) => {
       setPreviewUrl(url);
       setPreviewType(type);
       setPreviewTitle(title);
+      setPreviewTags(tags || []);
+      setPreviewBatchId(batchId || "");
     },
     []
   );
@@ -423,7 +428,9 @@ export default function UploadPage() {
                       openPreview(
                         result.url,
                         "image",
-                        result.title || "原图"
+                        result.title || "原图",
+                        result.tags,
+                        result.batchId
                       )
                     }
                     className="px-3 py-1.5 text-sm bg-blue-100 text-blue-700 rounded hover:bg-blue-200 transition-colors"
@@ -443,6 +450,8 @@ export default function UploadPage() {
           url={previewUrl}
           type={previewType}
           title={previewTitle}
+          tags={previewTags}
+          batchId={previewBatchId}
           onClose={closePreview}
         />
       )}

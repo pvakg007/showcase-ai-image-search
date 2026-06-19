@@ -306,7 +306,7 @@ function buildMarkdown(analysis, imageUrl, timestamp, spaceNames) {
 /**
  * 处理单个文件的完整流程：上传COS → Spark API 分析 → 生成MD → 索引Meilisearch
  */
-async function processFile(file, spaceNameArr, index) {
+async function processFile(file, spaceNameArr, index, batchId) {
   var arrayBuffer = await file.arrayBuffer();
   var buffer = Buffer.from(arrayBuffer);
   var timestamp = Date.now() + index;
@@ -505,6 +505,7 @@ async function processFile(file, spaceNameArr, index) {
     spaceNames: spaceNameArr || [],
     spaceName: (Array.isArray(spaceNameArr) ? spaceNameArr.join("、") : spaceNameArr || ""),
     createdAt: timestamp,
+    batchId: batchId || "",
   };
 
   try {
@@ -528,6 +529,23 @@ async function processFile(file, spaceNameArr, index) {
 
 export async function POST(req) {
   try {
+    // 生成批次 ID，用于关联同一次上传的多张图片
+    var batchId = Date.now().toString();
+
+    // 配置 Meilisearch 索引（幂等操作，只执行一次）
+    try {
+      axios.patch(
+        process.env.MEILISEARCH_HOST + "/indexes/design_images/settings",
+        { filterableAttributes: ["batchId"] },
+        {
+          headers: {
+            Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY,
+            "Content-Type": "application/json",
+          },
+        }
+      ).catch(function () {}); // 静默失败，不影响上传流程
+    } catch (_) {}
+
     var formData = await req.formData();
 
     // 获取文件列表（兼容新老字段名）
@@ -577,7 +595,7 @@ export async function POST(req) {
         "空间:" + (parsedNames.length > 0 ? parsedNames.join("、") : "未指定")
       );
 
-      var doc = await processFile(file, parsedNames, i);
+      var doc = await processFile(file, parsedNames, i, batchId);
       results.push(doc);
     }
 

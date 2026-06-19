@@ -41,6 +41,8 @@ export default function Home() {
     "image"
   );
   const [previewTitle, setPreviewTitle] = useState("");
+  const [previewTags, setPreviewTags] = useState<string[]>([]);
+  const [previewBatchId, setPreviewBatchId] = useState<string | number>("");
 
   const debouncedSearchText = useDebounce(searchText, 300);
 
@@ -96,10 +98,12 @@ export default function Home() {
 
   // 打开预览弹窗
   const openPreview = useCallback(
-    (url: string, type: "image" | "markdown", title: string) => {
+    (url: string, type: "image" | "markdown", title: string, tags?: string[], batchId?: string | number) => {
       setPreviewUrl(url);
       setPreviewType(type);
       setPreviewTitle(title);
+      setPreviewTags(tags || []);
+      setPreviewBatchId(batchId || "");
     },
     []
   );
@@ -206,9 +210,9 @@ export default function Home() {
                       {img.summary}
                     </p>
 
-                    {/* 关键词标签 */}
+                    {/* 关键词标签（去掉通用词"设计图"） */}
                     <div className="flex flex-wrap gap-1 mb-3">
-                      {img.tags.slice(0, 5).map((tag) => (
+                      {img.tags.filter(function (t) { return t !== "设计图"; }).slice(0, 5).map((tag) => (
                         <span
                           key={tag}
                           className={`px-2 py-1 rounded-full text-xs cursor-pointer transition-colors ${
@@ -221,9 +225,9 @@ export default function Home() {
                           {tag}
                         </span>
                       ))}
-                      {img.tags.length > 5 && (
+                      {img.tags.filter(function (t) { return t !== "设计图"; }).length > 5 && (
                         <span className="px-2 py-1 bg-gray-100 text-gray-500 rounded-full text-xs">
-                          +{img.tags.length - 5}
+                          +{img.tags.filter(function (t) { return t !== "设计图"; }).length - 5}
                         </span>
                       )}
                     </div>
@@ -244,7 +248,7 @@ export default function Home() {
                       </button>
                       <button
                         onClick={() =>
-                          openPreview(img.url, "image", img.title)
+                          openPreview(img.url, "image", img.title, img.tags, (img as any).batchId)
                         }
                         className="flex-1 px-3 py-1 bg-blue-100 text-blue-700 hover:bg-blue-200 rounded text-center text-sm transition-colors"
                       >
@@ -265,6 +269,8 @@ export default function Home() {
           url={previewUrl}
           type={previewType}
           title={previewTitle}
+          tags={previewTags}
+          batchId={previewBatchId}
           onClose={closePreview}
         />
       )}

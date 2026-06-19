@@ -2,6 +2,13 @@
 
 import { useEffect, useState, useCallback } from "react";
 
+interface BatchImageItem {
+  id: number;
+  url: string;
+  title: string;
+  tags?: string[];
+}
+
 interface PreviewModalProps {
   /** URL to show — image URL or MD file URL */
   url: string;
@@ -9,6 +16,10 @@ interface PreviewModalProps {
   type: "image" | "markdown";
   /** Title displayed in header bar */
   title?: string;
+  /** Tags displayed below image (仅 image 类型) */
+  tags?: string[];
+  /** 批次 ID，用于同案例图片关联 */
+  batchId?: string | number;
   /** Close handler */
   onClose: () => void;
 }
@@ -21,16 +32,25 @@ export default function PreviewModal({
   url,
   type,
   title,
+  tags,
+  batchId,
   onClose,
 }: PreviewModalProps) {
   const [mdContent, setMdContent] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // 同案例图片
+  const [batchImages, setBatchImages] = useState<BatchImageItem[]>([]);
+  const [batchLoading, setBatchLoading] = useState(false);
+  const [showBatch, setShowBatch] = useState(false);
 
   // 如果是 markdown 类型，通过代理拉取内容（避免 COS CORS 限制）
   useEffect(() => {
     if (type === "markdown") {
       setLoading(true);
       setMdContent("");
+      setShowBatch(false);
+      setBatchImages([]);
       var fetchUrl = url.startsWith("http")
         ? "/api/raw?url=" + encodeURIComponent(url)
         : url;
@@ -67,6 +87,26 @@ export default function PreviewModal({
       document.body.style.overflow = "";
     };
   }, []);
+
+  // 加载同案例图片
+  var loadBatchImages = useCallback(async function () {
+    if (!batchId) return;
+    setBatchLoading(true);
+    try {
+      var res = await fetch("/api/images/by-batch?batchId=" + batchId);
+      var data = await res.json();
+      if (data.success) {
+        // 排除当前图片
+        var others = (data.data || []).filter(function (img: BatchImageItem) {
+          return img.url !== url;
+        });
+        setBatchImages(others);
+        setShowBatch(true);
+      }
+    } catch (_) {} finally {
+      setBatchLoading(false);
+    }
+  }, [batchId, url]);
 
   // 简单的 markdown 行渲染
   const renderMarkdownLine = useCallback((line: string, i: number) => {
@@ -141,6 +181,11 @@ export default function PreviewModal({
     );
   }, []);
 
+  // 过滤掉 "设计图" 的标签
+  var displayTags = (tags || []).filter(function (t) {
+    return t !== "设计图";
+  });
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 md:p-8"
@@ -166,11 +211,77 @@ export default function PreviewModal({
         {/* 内容区 */}
         <div className="flex-1 overflow-auto p-5">
           {type === "image" ? (
-            <img
-              src={url}
-              alt={title || "预览"}
-              className="max-w-full h-auto mx-auto rounded"
-            />
+            <>
+              {/* 大图 */}
+              <img
+                src={url}
+                alt={title || "预览"}
+                className="max-w-full h-auto mx-auto rounded"
+              />
+
+              {/* 标签显示 */}
+              {displayTags.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 mt-4 justify-center">
+                  {displayTags.map(function (tag) {
+                    return (
+                      <span
+                        key={tag}
+                        className="px-3 py-1 bg-gray-100 text-gray-700 rounded-full text-sm"
+                      >
+                        {tag}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* 同案例图片按钮 */}
+              {batchId && !showBatch && (
+                <div className="mt-4 text-center">
+                  <button
+                    onClick={loadBatchImages}
+                    disabled={batchLoading}
+                    className="px-5 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:bg-gray-300 disabled:text-gray-500 transition-colors text-sm"
+                  >
+                    {batchLoading ? "加载中..." : "同案例图片"}
+                  </button>
+                </div>
+              )}
+
+              {/* 同案例图片网格 */}
+              {showBatch && batchImages.length > 0 && (
+                <div className="mt-5">
+                  <h4 className="text-sm font-semibold text-gray-600 mb-3 text-center">
+                    同案例图片（共 {batchImages.length + 1} 张）
+                  </h4>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                    {batchImages.map(function (img) {
+                      return (
+                        <div
+                          key={img.id}
+                          className="cursor-pointer group"
+                          onClick={function () {
+                            // 在当前位置打开该图片（模拟点击图片切换）
+                            window.open(img.url, "_blank");
+                          }}
+                        >
+                          <div className="aspect-square overflow-hidden rounded-lg border border-gray-200">
+                            <img
+                              src={img.url}
+                              alt={img.title}
+                              className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                            />
+                          </div>
+                          <p className="text-xs text-gray-500 mt-1 truncate">
+                            {img.title}
+                          </p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </>
           ) : loading ? (
             <div className="flex items-center justify-center py-20 text-gray-400">
               <svg
