@@ -1,3 +1,4 @@
+export const dynamic = "force-dynamic";
 /**
  * 管理后台 — AI 服务商设置 API
  *
@@ -91,7 +92,7 @@ export async function GET(req) {
     return Response.json({
       success: true,
       data: {
-        aiUrl: settings.aiUrl || process.env.SPARK_API_URL || "https://dashscope.aliyuncs.com/apps/anthropic",
+        aiUrl: settings.aiUrl || process.env.SPARK_API_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1",
         aiModel: settings.aiModel || process.env.SPARK_MODEL || "qwen3.6-plus",
         envUrl: process.env.SPARK_API_URL || "",
         envModel: process.env.SPARK_MODEL || "",
@@ -114,7 +115,7 @@ export async function PUT(req) {
 
     // 只允许修改 aiUrl 和 aiModel
     var updates = {};
-    if (body.aiUrl !== undefined) updates.aiUrl = body.aiUrl.replace(/\/+$/, "");
+    if (body.aiUrl !== undefined) updates.aiUrl = body.aiUrl.replace(/\/+$/, "").replace("/chat/completions", "");
     if (body.aiModel !== undefined) updates.aiModel = body.aiModel.trim();
 
     var current = await readSettings();

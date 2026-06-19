@@ -1,3 +1,4 @@
+export const dynamic = "force-dynamic";
 /**
  * 首次初始化管理员账号
  *

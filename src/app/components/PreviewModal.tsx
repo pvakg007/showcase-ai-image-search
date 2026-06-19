@@ -181,10 +181,7 @@ export default function PreviewModal({
     );
   }, []);
 
-  // 过滤掉 "设计图" 的标签
-  var displayTags = (tags || []).filter(function (t) {
-    return t !== "设计图";
-  });
+  var displayTags = tags || [];
 
   return (
     <div

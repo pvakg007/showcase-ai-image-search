@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import COS from "cos-nodejs-sdk-v5";
 import axios from "axios";
 import path from "path";
@@ -55,7 +57,7 @@ function tryParseJson(text) {
 }
 
 function extractSearchFields(analysis) {
-  var title = "未命名图片", summary = "暂无总结", tags = ["设计图"];
+  var title = "未命名图片", summary = "暂无总结", tags = [];
   try {
     var sd = analysis?.styleDefinition;
     var oes = analysis?.overallEmotionalStyle;
@@ -64,7 +66,7 @@ function extractSearchFields(analysis) {
     if (oes?.coreTemperament) parts.push("核心气质：" + oes.coreTemperament);
     if (Array.isArray(oes?.detailedInterpretation)) parts.push.apply(parts, oes.detailedInterpretation);
     if (parts.length > 0) summary = parts.join("；");
-    var tagSet = new Set(["设计图"]);
+    var tagSet = new Set();
     if (sd?.coreStyle) sd.coreStyle.split(/[、,，/\/\s]+/).forEach(function (t) { var c = t.trim(); if (c) tagSet.add(c); });
     if (sd?.designTechniques) sd.designTechniques.split(/[、,，/\/\s]+/).forEach(function (t) { var c = t.trim(); if (c) tagSet.add(c); });
     if (sd?.emotionalTone) sd.emotionalTone.split(/[、,，/\/\s]+/).forEach(function (t) { var c = t.trim(); if (c) tagSet.add(c); });
@@ -164,7 +166,7 @@ async function compressImage(buffer, maxPx) {
     return await sharp(buffer).resize(opts).jpeg({ quality: 85 }).toBuffer();
   } catch (err) {
     console.warn("服务端压缩失败:", err.message);
-    return buffer; // 返回原始数据，不阻塞流程
+    return buffer;
   }
 }
 
@@ -201,7 +203,6 @@ async function processSingleImage(fileInfo, index, promptContent, batchId) {
     var compressed = await compressImage(buffer, 1600);
     var compressedKey = cosKey.replace(/^temp\//, "images/").replace(/\.[^.]+$/, ".jpg");
 
-    // 上传压缩后的图片（public-read）
     await new Promise(function (resolve, reject) {
       cos.putObject({
         Bucket: process.env.COS_BUCKET,
@@ -213,19 +214,14 @@ async function processSingleImage(fileInfo, index, promptContent, batchId) {
       }, function (err) { if (err) reject(err); else resolve(); });
     });
 
-    // 删除临时文件
     cos.deleteObject({
       Bucket: process.env.COS_BUCKET,
       Region: process.env.COS_REGION,
       Key: cosKey,
     }, function () {});
 
-    var imageUrl = "https://" + compressedKey;
-    // 对于 COS，需要加上 bucket 域名前缀
-    // 实际格式：https://<bucket>.cos.<region>.myqcloud.com/<key>
-    // 但 SDK 的 Location 返回的是完整路径，这里手动拼接
     var bucketDomain = (process.env.COS_BUCKET || "") + ".cos." + (process.env.COS_REGION || "") + ".myqcloud.com";
-    imageUrl = "https://" + bucketDomain + "/" + compressedKey;
+    var imageUrl = "https://" + bucketDomain + "/" + compressedKey;
 
     // 3. 构建提示词
     var spaceLabel = Array.isArray(fileInfo.spaceNames) && fileInfo.spaceNames.length > 0
@@ -233,15 +229,16 @@ async function processSingleImage(fileInfo, index, promptContent, batchId) {
 
     var promptForImage = "图 " + (index + 1) + "：" + spaceLabel + "\n\n" + promptContent;
 
-    // 4. 调用 Spark API
+    // 4. 调用 AI API（智能识别多种格式）
     console.log("[process] AI 分析:", compressedKey);
     var base64Image = compressed.toString("base64");
     var analysisRaw = "";
     var analysis = null;
 
-    // 先尝试从 COS 读取 AI 设置（服务商地址 + 模型名），再回退到环境变量
-    var aiUrl = process.env.SPARK_API_URL || "https://dashscope.aliyuncs.com/apps/anthropic";
+    // 先尝试从 COS 读取 AI 设置，再回退到环境变量
+    var aiUrl = process.env.SPARK_API_URL || "";
     var aiModel = process.env.SPARK_MODEL || "qwen3.6-plus";
+    var aiKey = process.env.SPARK_API_KEY || process.env.DASHSCOPE_API_KEY || "";
     try {
       var configData = await new Promise(function (resolve, reject) {
         cos.getObject({
@@ -254,40 +251,140 @@ async function processSingleImage(fileInfo, index, promptContent, batchId) {
       var settings = JSON.parse(configBody.toString("utf-8"));
       if (settings.aiUrl) aiUrl = settings.aiUrl;
       if (settings.aiModel) aiModel = settings.aiModel;
-    } catch (_) { /* 无配置文件，使用环境变量默认值 */ }
+    } catch (_) {}
 
-    var apiBase = aiUrl.replace(/\/+$/, "");
-    var urlsToTry = [apiBase + "/v1/messages", apiBase];
+    // ========== 多 URL 兜底列表（按测试结果排序） ==========
+    // 已确认有效的 URL + OpenAI 格式
+    var FALLBACK_URLS = [
+      aiUrl,  // 用户配置/环境变量中的 URL（优先）
+      "https://llm-28jx4qmqak31ymc9.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+      "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
+      "https://ws-zwf60r4eps2lu9v2.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1",
+    ].filter(function (u) { return u && u.length > 0; });
+
+    // OpenAI Chat 格式（已确认可用）— 带图片
+    var openaiBodyWithImage = {
+      model: aiModel, max_tokens: 4096,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: promptForImage },
+          { type: "image_url", image_url: { url: "data:image/jpeg;base64," + base64Image } },
+        ],
+      }],
+    };
+    // 纯文本兜底（某些模型不支持图片）
+    var openaiBodyTextOnly = {
+      model: aiModel, max_tokens: 4096,
+      messages: [{
+        role: "user",
+        content: promptForImage,
+      }],
+    };
+    var openaiHeadersDual = {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + aiKey,
+      "x-dashscope-api-key": aiKey,
+    };
+
     var sparkRes = null;
+    var lastErrMsg = "";
+    var AI_TIMEOUT_FIRST = 25000; // 第一轮(带图片)每URL 25s，快速跳过慢节点
+    var AI_TIMEOUT_SECOND = 40000; // 第二轮(纯文本) 40s，比带图片快
 
-    for (var u = 0; u < urlsToTry.length; u++) {
+    // ========== 第一轮：带图片的 OpenAI 格式，遍历多个 URL ==========
+    for (var u = 0; u < FALLBACK_URLS.length && !analysisRaw; u++) {
+      var baseUrl = FALLBACK_URLS[u].replace(/\/+$/, "");
+      var chatUrl = baseUrl.indexOf("/chat/completions") === -1
+        ? baseUrl + "/chat/completions" : baseUrl;
+
       try {
-        sparkRes = await axios.post(urlsToTry[u], {
-          model: aiModel,
-          max_tokens: 4096,
-          messages: [{
-            role: "user",
-            content: [
-              { type: "text", text: promptForImage },
-              { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64Image } },
-            ],
-          }],
-        }, {
-          headers: { "x-api-key": process.env.SPARK_API_KEY || "", "Content-Type": "application/json" },
-          timeout: 60000,
+        console.log("[AI] 尝试 URL" + (u + 1) + " 带图片: " + chatUrl);
+        sparkRes = await axios.post(chatUrl, openaiBodyWithImage, {
+          headers: openaiHeadersDual, timeout: AI_TIMEOUT_FIRST,
         });
-        if (sparkRes && sparkRes.status < 500) break;
+        if (sparkRes && sparkRes.status < 500) {
+          var rd = sparkRes.data;
+          if (rd && rd.choices && rd.choices[0] && rd.choices[0].message && rd.choices[0].message.content) {
+            analysisRaw = rd.choices[0].message.content;
+            break;
+          }
+          // Anthropic 格式响应（极低概率但保留）
+          if (rd && rd.content && rd.content[0] && rd.content[0].text) {
+            analysisRaw = rd.content[0].text;
+            break;
+          }
+          if (rd && rd.error && rd.error.message) {
+            lastErrMsg = "[URL" + (u + 1) + " 带图片] API 返回错误: " + rd.error.message;
+          } else {
+            lastErrMsg = "[URL" + (u + 1) + " 带图片] 响应格式无法识别: " + JSON.stringify(rd).substring(0, 200);
+          }
+        }
       } catch (err) {
-        if (err.response && err.response.status < 500) break;
+        var statusCode = err.response?.status || 0;
+        var msg = err.response?.data?.error?.message || err.response?.data?.message || err.message || "未知错误";
+        lastErrMsg = "[URL" + (u + 1) + " 带图片] " + msg;
+        console.warn("[AI] " + lastErrMsg);
+        if (statusCode === 401 || statusCode === 403) break; // 认证错误直接终止
       }
     }
 
-    if (sparkRes && sparkRes.data && sparkRes.data.content && sparkRes.data.content[0]) {
-      analysisRaw = sparkRes.data.content[0].text || "";
-      analysis = tryParseJson(analysisRaw);
+    // ========== 第二轮：如果带图片失败，尝试纯文本 ==========
+    if (!analysisRaw) {
+      for (var u2 = 0; u2 < FALLBACK_URLS.length && !analysisRaw; u2++) {
+        var baseUrl2 = FALLBACK_URLS[u2].replace(/\/+$/, "");
+        var chatUrl2 = baseUrl2.indexOf("/chat/completions") === -1
+          ? baseUrl2 + "/chat/completions" : baseUrl2;
+
+        try {
+          console.log("[AI] 尝试 URL" + (u2 + 1) + " 纯文本: " + chatUrl2);
+          sparkRes = await axios.post(chatUrl2, openaiBodyTextOnly, {
+            headers: openaiHeadersDual, timeout: AI_TIMEOUT_SECOND,
+          });
+          if (sparkRes && sparkRes.status < 500) {
+            var rd2 = sparkRes.data;
+            if (rd2 && rd2.choices && rd2.choices[0] && rd2.choices[0].message && rd2.choices[0].message.content) {
+              analysisRaw = rd2.choices[0].message.content;
+              break;
+            }
+            if (rd2 && rd2.content && rd2.content[0] && rd2.content[0].text) {
+              analysisRaw = rd2.content[0].text;
+              break;
+            }
+            if (rd2 && rd2.error && rd2.error.message) {
+              lastErrMsg = "[URL" + (u2 + 1) + " 纯文本] API 返回错误: " + rd2.error.message;
+            } else {
+              lastErrMsg = "[URL" + (u2 + 1) + " 纯文本] 响应格式无法识别: " + JSON.stringify(rd2).substring(0, 200);
+            }
+          }
+        } catch (err) {
+          var statusCode2 = err.response?.status || 0;
+          var msg2 = err.response?.data?.error?.message || err.response?.data?.message || err.message || "未知错误";
+          lastErrMsg = "[URL" + (u2 + 1) + " 纯文本] " + msg2;
+          console.warn("[AI] " + lastErrMsg);
+          if (statusCode2 === 401 || statusCode2 === 403) break;
+        }
+      }
     }
 
-    var searchFields = extractSearchFields(analysis);
+    if (analysisRaw) {
+      analysis = tryParseJson(analysisRaw);
+      if (!analysis) {
+        console.warn("[AI] 返回内容非合法 JSON，原文前200字:", analysisRaw.substring(0, 200));
+      }
+    } else if (lastErrMsg) {
+      console.error("[AI API 最终错误]", lastErrMsg);
+      analysisRaw = lastErrMsg;
+    }
+
+    // AI 失败时将错误信息展示给用户
+    var searchFields;
+    if (!analysis && lastErrMsg) {
+      searchFields = { title: "AI 分析失败", summary: "错误: " + lastErrMsg.substring(0, 300), tags: [] };
+    } else {
+      searchFields = extractSearchFields(analysis);
+    }
     var timestamp = Date.now() + index;
 
     // 5. 生成并上传 MD
@@ -357,7 +454,6 @@ export async function GET(req) {
 
     var hits = searchRes.data.hits || [];
     if (hits.length === 0) {
-      // 检查是否有待重试的任务
       var retryRes = await axios.post(
         process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/search",
         { q: "", filter: 'status = "failed" AND retryCount < maxRetries', limit: 1, sort: ["nextRetryAt:asc"] },
@@ -366,7 +462,6 @@ export async function GET(req) {
       hits = retryRes.data.hits || [];
       if (hits.length > 0) {
         var now = Date.now();
-        // 只取已到重试时间的
         hits = hits.filter(function (j) { return (j.nextRetryAt || 0) <= now; });
         if (hits.length === 0) {
           return Response.json({ success: true, message: "暂无可处理的任务" });
@@ -397,21 +492,17 @@ export async function GET(req) {
     }
 
     var files = job.files || [];
-    var results = (job.results || []).slice(); // 保留已有结果
+    var results = (job.results || []).slice();
     var allSuccess = true;
 
     // 4. 处理图片
     if (job.type === "batch") {
-      // 批量模式：所有图片放到一个 prompt（但 Spark API 可能不支持多图，所以退化为逐张）
-      // 实际上用逐张处理更可靠
       for (var fi = 0; fi < files.length; fi++) {
-        // 跳过已成功处理的
         if (results[fi] && results[fi].status === "success") continue;
         var r = await processSingleImage(files[fi], fi, promptContent, jobId);
         results[fi] = r;
         if (r.status !== "success") allSuccess = false;
 
-        // 更新进度
         await axios.post(
           process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/documents",
           [{ id: jobId, results: results, updatedAt: Date.now() }],
@@ -419,7 +510,6 @@ export async function GET(req) {
         );
       }
     } else {
-      // 逐张模式：每张图单独分析
       for (var fi2 = 0; fi2 < files.length; fi2++) {
         if (results[fi2] && results[fi2].status === "success") continue;
         var r2 = await processSingleImage(files[fi2], fi2, promptContent, jobId);
@@ -451,7 +541,6 @@ export async function GET(req) {
           { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
         );
       } else {
-        // 5分钟后重试
         var nextRetryAt = Date.now() + 5 * 60 * 1000;
         await axios.post(
           process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/documents",

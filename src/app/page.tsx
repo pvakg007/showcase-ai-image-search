@@ -247,9 +247,9 @@ export default function Home() {
                       {img.summary}
                     </p>
 
-                    {/* 关键词标签（去掉通用词"设计图"） */}
+                    {/* 关键词标签 */}
                     <div className="flex flex-wrap gap-1 mb-3">
-                      {img.tags.filter(function (t) { return t !== "设计图"; }).slice(0, 5).map((tag) => (
+                      {img.tags.slice(0, 5).map((tag) => (
                         <span
                           key={tag}
                           className={`px-2 py-1 rounded-full text-xs cursor-pointer transition-colors ${
@@ -262,9 +262,9 @@ export default function Home() {
                           {tag}
                         </span>
                       ))}
-                      {img.tags.filter(function (t) { return t !== "设计图"; }).length > 5 && (
+                      {img.tags.length > 5 && (
                         <span className="px-2 py-1 bg-gray-100 text-gray-500 rounded-full text-xs">
-                          +{img.tags.filter(function (t) { return t !== "设计图"; }).length - 5}
+                          +{img.tags.length - 5}
                         </span>
                       )}
                     </div>

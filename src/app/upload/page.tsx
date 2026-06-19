@@ -75,9 +75,22 @@ export default function UploadPage() {
     setRecentProjects(loadRecentProjects());
   }, []);
 
-  // 轮询任务状态
+  // 自动触发处理 + 轮询任务状态
   useEffect(function () {
     if (!lastJobId) return;
+    var triggerCount = 0;
+
+    // 1. 先主动触发处理
+    async function triggerProcessing() {
+      try {
+        var res = await fetch("/api/process-queue");
+        var data = await res.json();
+        if (data.success) setJobStatus("processing");
+      } catch (_) {}
+    }
+    triggerProcessing();
+
+    // 2. 轮询状态，每隔 3 秒检查一次
     var timer = setInterval(async function () {
       try {
         var res = await fetch("/api/jobs/status?jobId=" + lastJobId);
@@ -92,19 +105,53 @@ export default function UploadPage() {
             setJobStatus("completed");
             setResults(data.data.results || []);
             clearInterval(timer);
+            return;
           } else if (data.data.status === "failed") {
             setJobStatus("failed");
             clearInterval(timer);
+            return;
           } else if (data.data.status === "processing") {
             setJobStatus("processing");
+            return; // 状态已确认，不再需要额外触发
           }
+        }
+
+        // 3. 如果状态仍是 pending 超过 6 秒，重新触发处理
+        triggerCount++;
+        if (triggerCount <= 3) {
+          fetch("/api/process-queue").catch(function () {});
         }
       } catch (_) {}
     }, 3000);
     return function () { clearInterval(timer); };
   }, [lastJobId]);
 
-  // ========== 文件选择 ==========
+  // ========== 客户端图片压缩 ==========
+  async function compressImage(file: File, maxWidth = 1600, quality = 0.8): Promise<File> {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.onload = function () {
+        var canvas = document.createElement("canvas");
+        var w = img.width, h = img.height;
+        if (w > maxWidth) { h = Math.round(h * maxWidth / w); w = maxWidth; }
+        if (h > maxWidth) { w = Math.round(w * maxWidth / h); h = maxWidth; }
+        canvas.width = w; canvas.height = h;
+        var ctx = canvas.getContext("2d")!;
+        ctx.drawImage(img, 0, 0, w, h);
+        canvas.toBlob(function (blob) {
+          if (!blob) { reject(new Error("压缩失败")); return; }
+          var newName = file.name.replace(/\.[^.]+$/, ".jpg");
+          resolve(new File([blob], newName, { type: "image/jpeg" }));
+        }, "image/jpeg", quality);
+      };
+      img.onerror = function () { reject(new Error("图片加载失败")); };
+      var reader = new FileReader();
+      reader.onload = function (e) { img.src = e.target!.result as string; };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // ========== 文件选择（自动压缩） ==========
   const handleFileChange = useCallback(function (e: React.ChangeEvent<HTMLInputElement>) {
     var selectedFiles = Array.from(e.target.files || []);
     if (selectedFiles.length === 0) return;
@@ -112,11 +159,19 @@ export default function UploadPage() {
     var newItems: FileItem[] = [];
     var loadedCount = 0;
 
-    selectedFiles.forEach(function (file, index) {
+    selectedFiles.forEach(async function (file, index) {
+      // 非 JPEG 且 > 200KB 的图片先压缩
+      var fileToUse = file;
+      if (file.type !== "image/jpeg" || file.size > 200 * 1024) {
+        try {
+          fileToUse = await compressImage(file);
+        } catch (_) { /* 压缩失败就用原文件 */ }
+      }
+
       var reader = new FileReader();
       reader.onload = function (event) {
         newItems[index] = {
-          file: file,
+          file: fileToUse,
           preview: (event.target?.result as string) || "",
           spaceNames: [],
         };
@@ -129,7 +184,7 @@ export default function UploadPage() {
           e.target.value = "";
         }
       };
-      reader.readAsDataURL(file);
+      reader.readAsDataURL(fileToUse);
     });
   }, []);
 

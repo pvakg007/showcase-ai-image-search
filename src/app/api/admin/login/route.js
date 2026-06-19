@@ -1,3 +1,4 @@
+export const dynamic = "force-dynamic";
 /**
  * 管理后台登录 API
  *
