@@ -26,19 +26,28 @@ export default function PreviewModal({
   const [mdContent, setMdContent] = useState("");
   const [loading, setLoading] = useState(false);
 
-  // 如果是 markdown 类型，拉取内容
+  // 如果是 markdown 类型，通过代理拉取内容（避免 COS CORS 限制）
   useEffect(() => {
     if (type === "markdown") {
       setLoading(true);
       setMdContent("");
-      fetch(url)
-        .then((res) => {
-          if (!res.ok) throw new Error("加载失败");
+      var fetchUrl = url.startsWith("http")
+        ? "/api/raw?url=" + encodeURIComponent(url)
+        : url;
+      fetch(fetchUrl)
+        .then(function (res) {
+          if (!res.ok) throw new Error("加载失败 (HTTP " + res.status + ")");
           return res.text();
         })
-        .then((text) => setMdContent(text))
-        .catch(() => setMdContent("⚠ 加载失败，请检查链接是否有效"))
-        .finally(() => setLoading(false));
+        .then(function (text) {
+          setMdContent(text);
+        })
+        .catch(function (err) {
+          setMdContent("⚠ " + err.message);
+        })
+        .finally(function () {
+          setLoading(false);
+        });
     }
   }, [url, type]);
 

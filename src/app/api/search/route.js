@@ -4,11 +4,24 @@ export async function POST(req) {
   try {
     const { q, filter } = await req.json();
 
-    const searchParams = {
-      q: q || "",
+    // 支持逗号分隔的多关键词：所有词必须同时匹配（AND 逻辑）
+    var query = q || "";
+    var hasComma = /[,，]/.test(query);
+    if (hasComma) {
+      // 逗号换成空格，Meilisearch 默认 OR，用 matchingStrategy: all 强制 AND
+      query = query.replace(/[,，]+/g, " ").trim();
+    }
+
+    var searchParams = {
+      q: query || "",
       limit: 50,
       attributesToSearchOn: ["title", "summary", "tags"],
     };
+
+    // 多关键词时要求所有词必须匹配 (AND)
+    if (hasComma && query) {
+      searchParams.matchingStrategy = "all";
+    }
 
     // 如果有关键词筛选条件，传递给 Meilisearch
     if (filter) {
