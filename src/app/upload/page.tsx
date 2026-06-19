@@ -55,15 +55,24 @@ async function compressIfNeeded(file: File, maxPx = 1600): Promise<File> {
   // 非图片类型直接跳过
   if (!file.type.startsWith("image/")) return file;
 
-  const dataUrl = URL.createObjectURL(file);
+  // 已经是 JPEG 且最大边不超过限制 → 无需处理
+  if (file.type === "image/jpeg") {
+    const dataUrl = URL.createObjectURL(file);
+    try {
+      const img = await loadImage(dataUrl);
+      if (Math.max(img.width, img.height) <= maxPx) return file;
+    } finally {
+      URL.revokeObjectURL(dataUrl);
+    }
+  }
 
+  // 非 JPEG（PNG/WebP 等）或需要压缩 → 统一转为 JPEG
+  const dataUrl = URL.createObjectURL(file);
   try {
     const img = await loadImage(dataUrl);
 
     const maxDim = Math.max(img.width, img.height);
-    if (maxDim <= maxPx) return file;
-
-    const scale = maxPx / maxDim;
+    const scale = maxDim > maxPx ? maxPx / maxDim : 1;
     const w = Math.round(img.width * scale);
     const h = Math.round(img.height * scale);
 
