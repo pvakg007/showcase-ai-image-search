@@ -76,28 +76,54 @@ const EMBEDDED_PROMPT = [
 ].join("\n");
 
 /**
+ * 尝试从 GLM 返回文本中解析 JSON（兼容多种返回格式）
+ */
+function tryParseJson(text) {
+  if (!text) return null;
+  // 直接解析
+  try {
+    return JSON.parse(text);
+  } catch (_) {}
+  // 尝试提取 ```json ... ``` 代码块
+  var match = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (match) {
+    try {
+      return JSON.parse(match[1].trim());
+    } catch (_) {}
+  }
+  // 尝试提取第一个 { ... }
+  var braceMatch = text.match(/\{[\s\S]*\}/);
+  if (braceMatch) {
+    try {
+      return JSON.parse(braceMatch[0]);
+    } catch (_) {}
+  }
+  return null;
+}
+
+/**
  * 从 GLM 分析结果中提取简化的 title/summary/tags 用于 Meilisearch 索引
  */
 function extractSearchFields(analysis) {
-  let title = "未命名图片";
-  let summary = "暂无总结";
-  let tags = ["设计图"];
+  var title = "未命名图片";
+  var summary = "暂无总结";
+  var tags = ["设计图"];
 
   try {
-    const sd = analysis?.styleDefinition;
-    const oes = analysis?.overallEmotionalStyle;
-    const cds = analysis?.colorDesignSummary;
+    var sd = analysis?.styleDefinition;
+    var oes = analysis?.overallEmotionalStyle;
+    var cds = analysis?.colorDesignSummary;
 
     if (sd?.coreStyle) {
       title = sd.coreStyle + " 设计分析";
     }
 
-    const parts = [];
+    var parts = [];
     if (oes?.coreTemperament) {
       parts.push("核心气质：" + oes.coreTemperament);
     }
     if (Array.isArray(oes?.detailedInterpretation)) {
-      parts.push(...oes.detailedInterpretation);
+      parts.push.apply(parts, oes.detailedInterpretation);
     }
     if (cds?.coreApplication) {
       parts.push(cds.coreApplication);
@@ -109,7 +135,7 @@ function extractSearchFields(analysis) {
       summary = parts.join("；");
     }
 
-    const tagSet = new Set();
+    var tagSet = new Set();
     tagSet.add("设计图");
 
     if (sd?.coreStyle) {
@@ -151,13 +177,13 @@ function extractSearchFields(analysis) {
     console.error("提取搜索字段出错:", err);
   }
 
-  return { title, summary, tags };
+  return { title: title, summary: summary, tags: tags };
 }
 
 /**
  * 构建丰富的 Markdown 总结文件内容
  */
-function buildMarkdown(analysis, imageUrl, timestamp) {
+function buildMarkdown(analysis, imageUrl, timestamp, spaceName) {
   var lines = [];
 
   try {
@@ -167,15 +193,20 @@ function buildMarkdown(analysis, imageUrl, timestamp) {
     var spaces = analysis?.spaceSoftDecorationAnalysis;
     var ideas = analysis?.generalMatchingIdeas;
 
-    lines.push("# " + (sd?.coreStyle || "设计分析"));
+    lines.push(
+      "# " + (sd?.coreStyle || (spaceName ? spaceName + " 设计分析" : "设计分析"))
+    );
     lines.push("");
     lines.push("---");
     lines.push("");
 
-    lines.push("## 基本信息");
-    lines.push("- **上传时间**: " + new Date(timestamp).toLocaleString());
-    lines.push("- **图片链接**: [查看原图](" + imageUrl + ")");
-    lines.push("");
+    if (sd || spaceName) {
+      lines.push("## 基本信息");
+      lines.push("- **上传时间**: " + new Date(timestamp).toLocaleString());
+      lines.push("- **图片链接**: [查看原图](" + imageUrl + ")");
+      if (spaceName) lines.push("- **空间名称**: " + spaceName);
+      lines.push("");
+    }
 
     if (sd) {
       lines.push("## 风格定义");
@@ -195,7 +226,7 @@ function buildMarkdown(analysis, imageUrl, timestamp) {
         lines.push("");
         lines.push("### 详细解读");
         oes.detailedInterpretation.forEach(function (item, i) {
-          lines.push((i + 1) + ". " + item);
+          lines.push(i + 1 + ". " + item);
         });
       }
       lines.push("");
@@ -210,14 +241,14 @@ function buildMarkdown(analysis, imageUrl, timestamp) {
         lines.push("");
         lines.push("### 核心手法");
         cds.coreTechniques.forEach(function (item, i) {
-          lines.push((i + 1) + ". " + item);
+          lines.push(i + 1 + ". " + item);
         });
       }
       if (Array.isArray(cds.balanceLogic)) {
         lines.push("");
         lines.push("### 平衡逻辑");
         cds.balanceLogic.forEach(function (item, i) {
-          lines.push((i + 1) + ". " + item);
+          lines.push(i + 1 + ". " + item);
         });
       }
       lines.push("");
@@ -227,7 +258,9 @@ function buildMarkdown(analysis, imageUrl, timestamp) {
       lines.push("## 空间软装分析");
       lines.push("");
       spaces.forEach(function (space, si) {
-        lines.push("### " + (si + 1) + ". " + (space.spaceName || "未命名空间"));
+        lines.push(
+          "### " + (si + 1) + ". " + (space.spaceName || "未命名空间")
+        );
         if (space.functionalAdaptation)
           lines.push("- **功能适配**: " + space.functionalAdaptation);
         if (space.hardwareBase)
@@ -236,7 +269,9 @@ function buildMarkdown(analysis, imageUrl, timestamp) {
           lines.push("");
           lines.push("**软装单品：**");
           space.softDecorationItems.forEach(function (item) {
-            lines.push("- **" + item.itemName + "**: " + item.matchingLogic);
+            lines.push(
+              "- **" + item.itemName + "**: " + item.matchingLogic
+            );
           });
         }
         lines.push("");
@@ -264,141 +299,178 @@ function buildMarkdown(analysis, imageUrl, timestamp) {
   return lines.join("\n");
 }
 
-export async function POST(req) {
+/**
+ * 处理单个文件的完整流程：上传COS → GLM分析 → 生成MD → 索引Meilisearch
+ */
+async function processFile(file, spaceName, index) {
+  var arrayBuffer = await file.arrayBuffer();
+  var buffer = Buffer.from(arrayBuffer);
+  var timestamp = Date.now() + index; // 加 index 确保每张图时间戳不重复
+  var imageFilename = "images/" + timestamp + "-" + file.name;
+
+  // 1. 上传图片到腾讯云 COS（设置公共读权限）
+  var imageResult = await cos.putObject({
+    Bucket: process.env.COS_BUCKET,
+    Region: process.env.COS_REGION,
+    Key: imageFilename,
+    Body: buffer,
+    ACL: "public-read",
+  });
+  var imageUrl = "https://" + imageResult.Location;
+
+  // 2. 读取提示词文件
+  var promptContent = "";
   try {
-    // 1. 获取上传的图片
-    const formData = await req.formData();
-    const file = formData.get("file");
-    const spaceName = formData.get("spaceName") || "";
+    var promptPath = path.join(process.cwd(), "提示词.txt");
+    promptContent = fs.readFileSync(promptPath, "utf-8");
+  } catch (err) {
+    console.warn("提示词文件读取失败，使用内嵌默认提示词:", err.message);
+    promptContent = EMBEDDED_PROMPT;
+  }
 
-    if (!file) {
-      return Response.json(
-        { success: false, error: "未选择文件" },
-        { status: 400 }
-      );
-    }
+  // 将空间名称嵌入提示词
+  promptContent =
+    "图 " +
+    (index + 1) +
+    "：" +
+    (spaceName || "未命名空间") +
+    "\n\n" +
+    promptContent;
 
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    const timestamp = Date.now();
-    const imageFilename = "images/" + timestamp + "-" + file.name;
+  // 3. 调用 GLM-4V 大模型分析图片
+  var analysis = null;
+  var analysisRaw = "";
 
-    // 2. 上传图片到腾讯云 COS
-    var imageResult = await cos.putObject({
-      Bucket: process.env.COS_BUCKET,
-      Region: process.env.COS_REGION,
-      Key: imageFilename,
-      Body: buffer,
-    });
-    var imageUrl = "https://" + imageResult.Location;
-
-    // 3. 读取提示词文件（文件不存在时使用内嵌默认提示词）
-    var promptContent = "";
-    try {
-      var promptPath = path.join(process.cwd(), "提示词.txt");
-      promptContent = fs.readFileSync(promptPath, "utf-8");
-    } catch (err) {
-      console.warn("提示词文件读取失败，使用内嵌默认提示词:", err.message);
-      promptContent = EMBEDDED_PROMPT;
-    }
-
-    // 如果有空间名称，附加到提示词中
-    if (spaceName) {
-      promptContent = "图 1：" + spaceName + "\n\n" + promptContent;
-    }
-
-    // 4. 调用 GLM-4V 大模型分析图片
-    var analysis = null;
-    var analysisRaw = "";
-
-    try {
-      var glmRes = await axios.post(
-        "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-        {
-          model: "glm-4v",
-          messages: [
-            {
-              role: "user",
-              content: [
-                { type: "text", text: promptContent },
-                { type: "image_url", image_url: { url: imageUrl } },
-              ],
-            },
-          ],
-          response_format: { type: "json_object" },
-        },
-        {
-          headers: {
-            Authorization: "Bearer " + process.env.GLM_API_KEY,
+  try {
+    var glmRes = await axios.post(
+      "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+      {
+        model: "glm-4v",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: promptContent },
+              { type: "image_url", image_url: { url: imageUrl } },
+            ],
           },
-        }
-      );
-
-      analysisRaw = glmRes.data.choices[0].message.content;
-      analysis = JSON.parse(analysisRaw);
-    } catch (err) {
-      console.error("GLM 分析错误:", err);
-    }
-
-    // 5. 提取用于搜索的简化字段
-    var searchFields = extractSearchFields(analysis);
-    var title = searchFields.title;
-    var summary = searchFields.summary;
-    var tags = searchFields.tags;
-
-    // 6. 生成丰富的 MD 总结文件
-    var mdContent = buildMarkdown(analysis, imageUrl, timestamp);
-    var mdFilename =
-      "summaries/" +
-      timestamp +
-      "-" +
-      file.name.replace(/\.[^/.]+$/, "") +
-      ".md";
-
-    // 7. 上传 .md 文件到腾讯云 COS
-    var mdResult = await cos.putObject({
-      Bucket: process.env.COS_BUCKET,
-      Region: process.env.COS_REGION,
-      Key: mdFilename,
-      Body: Buffer.from(mdContent, "utf-8"),
-      ContentType: "text/markdown; charset=utf-8",
-    });
-    var mdUrl = "https://" + mdResult.Location;
-
-    // 8. 尝试将原始分析 JSON 也保存一份（用于调试或后续处理）
-    var rawJsonUrl = "";
-    if (analysisRaw) {
-      try {
-        var rawFilename =
-          "summaries/" +
-          timestamp +
-          "-" +
-          file.name.replace(/\.[^/.]+$/, "") +
-          ".json";
-        var rawResult = await cos.putObject({
-          Bucket: process.env.COS_BUCKET,
-          Region: process.env.COS_REGION,
-          Key: rawFilename,
-          Body: Buffer.from(analysisRaw, "utf-8"),
-          ContentType: "application/json; charset=utf-8",
-        });
-        rawJsonUrl = "https://" + rawResult.Location;
-      } catch (err) {
-        console.warn("原始 JSON 保存失败:", err.message);
+        ],
+        temperature: 0.3,
+        // 注意: glm-4v 可能不支持 response_format，用提示词约束JSON输出
+      },
+      {
+        headers: {
+          Authorization: "Bearer " + process.env.GLM_API_KEY,
+        },
+        timeout: 120000,
       }
+    );
+
+    analysisRaw = glmRes.data.choices[0].message.content;
+    analysis = tryParseJson(analysisRaw);
+
+    if (!analysis) {
+      console.warn(
+        "GLM 返回非JSON内容（第" +
+          (index + 1) +
+          "张），前200字符:",
+        analysisRaw?.slice(0, 200)
+      );
+      // 原始内容仍保存到 COS，方便排查
+    } else {
+      console.log(
+        "GLM 分析成功:",
+        analysis.styleDefinition?.coreStyle || "未知风格"
+      );
     }
+  } catch (err) {
+    console.error("GLM 分析错误（第" + (index + 1) + "张图）:", err.message);
+    if (err.response) {
+      console.error(
+        "GLM 响应状态:",
+        err.response.status,
+        "数据:",
+        JSON.stringify(err.response.data).slice(0, 300)
+      );
+    }
+  }
 
-    // 9. 存入 Meilisearch 搜索引擎
-    var document = {
-      id: timestamp,
-      url: imageUrl,
-      mdUrl: mdUrl,
-      title: title,
-      summary: summary,
-      tags: tags,
-      createdAt: timestamp,
-    };
+  // 4. 提取用于搜索的字段
+  var searchFields = extractSearchFields(analysis);
 
+  // 如果 GLM 分析彻底失败但有空间名称，用空间名称兜底
+  if (!analysis && spaceName) {
+    searchFields.title = spaceName + " 设计图片";
+    searchFields.summary = "空间名称：" + spaceName + "（AI 分析暂不可用，请稍后重试）";
+    if (searchFields.tags.indexOf(spaceName) === -1) {
+      searchFields.tags.push(spaceName);
+    }
+  } else if (!analysis) {
+    searchFields.title = "设计图片 " + (index + 1);
+    searchFields.summary = "等待 AI 分析完成";
+  }
+
+  var title = searchFields.title;
+  var summary = searchFields.summary;
+  var tags = searchFields.tags;
+
+  // 5. 生成 MD 总结文件
+  var mdContent = buildMarkdown(analysis, imageUrl, timestamp, spaceName);
+  var mdFilename =
+    "summaries/" +
+    timestamp +
+    "-" +
+    file.name.replace(/\.[^/.]+$/, "") +
+    ".md";
+
+  // 6. 上传 .md 文件到腾讯云 COS（公共读权限）
+  var mdResult = await cos.putObject({
+    Bucket: process.env.COS_BUCKET,
+    Region: process.env.COS_REGION,
+    Key: mdFilename,
+    Body: Buffer.from(mdContent, "utf-8"),
+    ContentType: "text/markdown; charset=utf-8",
+    ACL: "public-read",
+  });
+  var mdUrl = "https://" + mdResult.Location;
+
+  // 7. 保存原始 JSON / 原始分析文本到 COS
+  var rawJsonUrl = "";
+  if (analysisRaw) {
+    try {
+      var rawFilename =
+        "summaries/" +
+        timestamp +
+        "-" +
+        file.name.replace(/\.[^/.]+$/, "") +
+        ".json";
+      var rawResult = await cos.putObject({
+        Bucket: process.env.COS_BUCKET,
+        Region: process.env.COS_REGION,
+        Key: rawFilename,
+        Body: Buffer.from(analysisRaw, "utf-8"),
+        ContentType: "application/json; charset=utf-8",
+        ACL: "public-read",
+      });
+      rawJsonUrl = "https://" + rawResult.Location;
+    } catch (err) {
+      console.warn("原始 JSON 保存失败:", err.message);
+    }
+  }
+
+  // 8. 存入 Meilisearch
+  var document = {
+    id: timestamp,
+    url: imageUrl,
+    mdUrl: mdUrl,
+    title: title,
+    summary: summary,
+    tags: tags,
+    spaceName: spaceName || "",
+    createdAt: timestamp,
+  };
+
+  try {
     await axios.post(
       process.env.MEILISEARCH_HOST + "/indexes/design_images/documents",
       [document],
@@ -409,11 +481,65 @@ export async function POST(req) {
         },
       }
     );
+    console.log("Meilisearch 索引成功：" + title);
+  } catch (err) {
+    console.error("Meilisearch 索引失败:", err.message);
+  }
+
+  return document;
+}
+
+export async function POST(req) {
+  try {
+    var formData = await req.formData();
+
+    // 获取文件列表（兼容新老字段名）
+    var files = formData.getAll("files");
+    if (!files || files.length === 0) {
+      var singleFile = formData.get("file");
+      if (singleFile) files = [singleFile];
+    }
+
+    if (!files || files.length === 0) {
+      return Response.json(
+        { success: false, error: "未选择文件" },
+        { status: 400 }
+      );
+    }
+
+    // 获取空间名称列表（兼容新老字段名）
+    var spaceNames = formData.getAll("spaceNames") || [];
+    if (spaceNames.length === 0 && formData.get("spaceName")) {
+      spaceNames = [formData.get("spaceName")];
+    }
+
+    var results = [];
+
+    for (var i = 0; i < files.length; i++) {
+      var file = files[i];
+      // 跳过无效项（FormData 中可能出现字符串）
+      if (!file || typeof file === "string") continue;
+
+      var spaceName = spaceNames[i] || "";
+      console.log(
+        "处理第" +
+          (i + 1) +
+          "/" +
+          files.length +
+          "张图片:",
+        file.name,
+        "空间:" + (spaceName || "未指定")
+      );
+
+      var doc = await processFile(file, spaceName, i);
+      results.push(doc);
+    }
 
     return Response.json({
       success: true,
-      message: "上传并分析成功",
-      data: document,
+      message: "上传成功！共处理 " + results.length + " 张图片",
+      count: results.length,
+      data: results,
     });
   } catch (error) {
     console.error("上传错误:", error);

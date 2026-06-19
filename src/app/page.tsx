@@ -9,6 +9,7 @@ interface ImageItem {
   title: string;
   summary: string;
   tags: string[];
+  spaceName?: string;
   createdAt: number;
 }
 
@@ -166,6 +167,11 @@ export default function Home() {
                   <h3 className="font-semibold text-lg mb-2 truncate">
                     {img.title}
                   </h3>
+                  {img.spaceName && (
+                    <p className="text-amber-700 text-xs mb-1">
+                      📍 {img.spaceName}
+                    </p>
+                  )}
                   <p className="text-gray-600 text-sm mb-3 line-clamp-2">
                     {img.summary}
                   </p>
