@@ -239,14 +239,31 @@ async function processSingleImage(fileInfo, index, promptContent, batchId) {
     var analysisRaw = "";
     var analysis = null;
 
-    var apiBase = (process.env.SPARK_API_URL || "https://dashscope.aliyuncs.com/apps/anthropic").replace(/\/+$/, "");
+    // 先尝试从 COS 读取 AI 设置（服务商地址 + 模型名），再回退到环境变量
+    var aiUrl = process.env.SPARK_API_URL || "https://dashscope.aliyuncs.com/apps/anthropic";
+    var aiModel = process.env.SPARK_MODEL || "qwen3.6-plus";
+    try {
+      var configData = await new Promise(function (resolve, reject) {
+        cos.getObject({
+          Bucket: process.env.COS_BUCKET,
+          Region: process.env.COS_REGION,
+          Key: "config/ai-settings.json",
+        }, function (err, d) { if (err) reject(err); else resolve(d); });
+      });
+      var configBody = Buffer.isBuffer(configData.Body) ? configData.Body : Buffer.from(configData.Body);
+      var settings = JSON.parse(configBody.toString("utf-8"));
+      if (settings.aiUrl) aiUrl = settings.aiUrl;
+      if (settings.aiModel) aiModel = settings.aiModel;
+    } catch (_) { /* 无配置文件，使用环境变量默认值 */ }
+
+    var apiBase = aiUrl.replace(/\/+$/, "");
     var urlsToTry = [apiBase + "/v1/messages", apiBase];
     var sparkRes = null;
 
     for (var u = 0; u < urlsToTry.length; u++) {
       try {
         sparkRes = await axios.post(urlsToTry[u], {
-          model: process.env.SPARK_MODEL || "qwen-max-latest",
+          model: aiModel,
           max_tokens: 4096,
           messages: [{
             role: "user",

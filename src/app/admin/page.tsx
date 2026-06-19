@@ -81,9 +81,66 @@ export default function AdminPage() {
     }
   }, [authenticated, searchText]);
 
+  // ========== AI 设置 ==========
+  var [aiUrl, setAiUrl] = useState("");
+  var [aiModel, setAiModel] = useState("");
+  var [settingsLoading, setSettingsLoading] = useState(false);
+  var [settingsMsg, setSettingsMsg] = useState("");
+
+  var loadSettings = useCallback(async () => {
+    setSettingsLoading(true);
+    var result = await adminFetch("/api/admin/settings");
+    if (result.success && result.data) {
+      setAiUrl(result.data.aiUrl || "");
+      setAiModel(result.data.aiModel || "");
+    }
+    setSettingsLoading(false);
+  }, []);
+
+  var saveSettings = useCallback(async () => {
+    setSettingsMsg("");
+    var result = await adminFetch("/api/admin/settings", {
+      method: "PUT",
+      body: JSON.stringify({ aiUrl, aiModel }),
+    });
+    if (result.success) {
+      setSettingsMsg("✅ " + (result.message || "已保存"));
+    } else {
+      setSettingsMsg("❌ " + (result.error || "保存失败"));
+    }
+  }, [aiUrl, aiModel]);
+
+  // 认证后加载设置
+  useEffect(() => {
+    if (authenticated) loadSettings();
+  }, [authenticated, loadSettings]);
+
+  // ========== 首次设置 ==========
+  var [showSetup, setShowSetup] = useState(false);
+  var [setupUser, setSetupUser] = useState("");
+  var [setupPass, setSetupPass] = useState("");
+  var [setupError, setSetupError] = useState("");
+
+  var handleSetup = useCallback(async () => {
+    setSetupError("");
+    var result = await fetch("/api/admin/setup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: setupUser, password: setupPass }),
+    });
+    var data = await result.json();
+    if (data.success && data.token) {
+      sessionStorage.setItem("admin_token", data.token);
+      setAuthenticated(true);
+    } else {
+      setSetupError(data.error || "初始化失败");
+    }
+  }, [setupUser, setupPass]);
+
   // ========== 登录 ==========
   var handleLogin = useCallback(async () => {
     setLoginError("");
+    setShowSetup(false);
     var result = await adminFetch("/api/admin/login", {
       method: "POST",
       body: JSON.stringify({
@@ -94,6 +151,9 @@ export default function AdminPage() {
     if (result.success && result.token) {
       sessionStorage.setItem("admin_token", result.token);
       setAuthenticated(true);
+    } else if (result.needSetup) {
+      setShowSetup(true);
+      setLoginError("⚠ 管理员账号尚未初始化，请设置初始账号密码");
     } else {
       setLoginError(result.error || "登录失败");
     }
@@ -229,48 +289,96 @@ export default function AdminPage() {
     });
   };
 
-  // ===== 未登录 → 登录页面 =====
+  // ===== 未登录 → 登录/首次设置页面 =====
   if (!authenticated) {
     return (
       <main className="min-h-screen bg-gray-100 flex items-center justify-center p-4">
         <div className="bg-white rounded-xl shadow-lg p-8 w-full max-w-sm">
-          <h1 className="text-2xl font-bold text-center mb-6">管理后台</h1>
-          <div className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium mb-1">用户名</label>
-              <input
-                type="text"
-                value={loginUser}
-                onChange={(e) => setLoginUser(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && handleLogin()}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="输入管理员用户名"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium mb-1">密码</label>
-              <input
-                type="password"
-                value={loginPass}
-                onChange={(e) => setLoginPass(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && handleLogin()}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="输入密码"
-              />
-            </div>
-            {loginError && (
-              <p className="text-red-500 text-sm">{loginError}</p>
-            )}
-            <button
-              onClick={handleLogin}
-              className="w-full py-2.5 bg-blue-500 text-white rounded-lg hover:bg-blue-600 font-medium transition-colors"
-            >
-              登录
-            </button>
-          </div>
-          <p className="text-xs text-gray-400 text-center mt-6">
-            ⚠ 环境变量需设置 ADMIN_USERNAME 和 ADMIN_PASSWORD
-          </p>
+          {!showSetup ? (
+            <>
+              <h1 className="text-2xl font-bold text-center mb-6">管理后台</h1>
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium mb-1">用户名</label>
+                  <input
+                    type="text"
+                    value={loginUser}
+                    onChange={(e) => setLoginUser(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && handleLogin()}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    placeholder="输入管理员用户名"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">密码</label>
+                  <input
+                    type="password"
+                    value={loginPass}
+                    onChange={(e) => setLoginPass(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && handleLogin()}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    placeholder="输入密码"
+                  />
+                </div>
+                {loginError && !showSetup && (
+                  <p className="text-red-500 text-sm">{loginError}</p>
+                )}
+                <button
+                  onClick={handleLogin}
+                  className="w-full py-2.5 bg-blue-500 text-white rounded-lg hover:bg-blue-600 font-medium transition-colors"
+                >
+                  登录
+                </button>
+              </div>
+              <p className="text-xs text-gray-400 text-center mt-6">
+                ⚠ 环境变量需设置 ADMIN_USERNAME 和 ADMIN_PASSWORD
+              </p>
+            </>
+          ) : (
+            <>
+              <h1 className="text-2xl font-bold text-center mb-2">首次初始化</h1>
+              <p className="text-sm text-gray-500 text-center mb-6">设置管理员账号密码</p>
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium mb-1">管理员用户名</label>
+                  <input
+                    type="text"
+                    value={setupUser}
+                    onChange={(e) => setSetupUser(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && handleSetup()}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    placeholder="例如 admin"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">管理员密码</label>
+                  <input
+                    type="password"
+                    value={setupPass}
+                    onChange={(e) => setSetupPass(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && handleSetup()}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    placeholder="至少 4 个字符"
+                  />
+                </div>
+                {setupError && (
+                  <p className="text-red-500 text-sm">{setupError}</p>
+                )}
+                <button
+                  onClick={handleSetup}
+                  className="w-full py-2.5 bg-green-500 text-white rounded-lg hover:bg-green-600 font-medium transition-colors"
+                >
+                  初始化并登录
+                </button>
+                <button
+                  onClick={() => { setShowSetup(false); setLoginError(""); }}
+                  className="w-full py-2 text-sm text-gray-500 hover:text-gray-700 transition-colors"
+                >
+                  返回登录
+                </button>
+              </div>
+            </>
+          )}
         </div>
       </main>
     );
@@ -331,6 +439,47 @@ export default function AdminPage() {
             </button>
           </div>
         </div>
+
+        {/* AI 服务商设置 */}
+        <details className="bg-white rounded-lg shadow-sm mb-4">
+          <summary className="px-4 py-3 cursor-pointer font-medium text-sm text-gray-700 hover:bg-gray-50 rounded-lg select-none">
+            ⚙ AI 服务商设置
+          </summary>
+          <div className="px-4 pb-4 border-t border-gray-100 pt-3 space-y-3">
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1">API 地址</label>
+              <input
+                type="text"
+                value={aiUrl}
+                onChange={(e) => setAiUrl(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
+                placeholder="https://dashscope.aliyuncs.com/apps/anthropic"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1">模型名称</label>
+              <input
+                type="text"
+                value={aiModel}
+                onChange={(e) => setAiModel(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
+                placeholder="qwen3.6-plus"
+              />
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={saveSettings}
+                disabled={settingsLoading}
+                className="px-4 py-1.5 text-sm bg-purple-500 text-white rounded-lg hover:bg-purple-600 disabled:bg-gray-300 transition-colors"
+              >
+                {settingsLoading ? "保存中..." : "保存设置"}
+              </button>
+              {settingsMsg && (
+                <span className="text-sm">{settingsMsg}</span>
+              )}
+            </div>
+          </div>
+        </details>
 
         {/* 列表 */}
         {loading ? (

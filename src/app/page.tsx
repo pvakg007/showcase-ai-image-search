@@ -44,6 +44,13 @@ export default function Home() {
   const [previewTags, setPreviewTags] = useState<string[]>([]);
   const [previewBatchId, setPreviewBatchId] = useState<string | number>("");
 
+  // 登录弹窗状态
+  const [showLogin, setShowLogin] = useState(false);
+  const [loginUser, setLoginUser] = useState("");
+  const [loginPass, setLoginPass] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [loginLoading, setLoginLoading] = useState(false);
+
   const debouncedSearchText = useDebounce(searchText, 300);
 
   // 页面加载和搜索条件变化时自动搜索
@@ -112,6 +119,30 @@ export default function Home() {
     setPreviewUrl(null);
   }, []);
 
+  // ========== 登录 ==========
+  const handleAdminLogin = useCallback(async () => {
+    setLoginError("");
+    setLoginLoading(true);
+    try {
+      var res = await fetch("/api/admin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: loginUser, password: loginPass }),
+      });
+      var data = await res.json();
+      if (data.success && data.token) {
+        sessionStorage.setItem("admin_token", data.token);
+        window.location.href = "/admin";
+      } else {
+        setLoginError(data.error || "登录失败");
+      }
+    } catch (err) {
+      setLoginError("网络错误");
+    } finally {
+      setLoginLoading(false);
+    }
+  }, [loginUser, loginPass]);
+
   // 获取显示用的空间名称
   const displaySpaceName = (img: ImageItem): string => {
     if (img.spaceNames && img.spaceNames.length > 0)
@@ -147,6 +178,12 @@ export default function Home() {
             >
               上传图片
             </a>
+            <button
+              onClick={() => setShowLogin(true)}
+              className="px-4 py-2 bg-gray-100 text-gray-700 hover:bg-gray-200 rounded-lg transition-colors text-sm"
+            >
+              管理登录
+            </button>
           </div>
 
           {selectedTags.length > 0 && (
@@ -273,6 +310,60 @@ export default function Home() {
           batchId={previewBatchId}
           onClose={closePreview}
         />
+      )}
+
+      {/* 登录弹窗 */}
+      {showLogin && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={(e) => { if (e.target === e.currentTarget) setShowLogin(false); }}
+        >
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-bold">管理员登录</h2>
+              <button
+                onClick={() => { setShowLogin(false); setLoginError(""); }}
+                className="w-7 h-7 flex items-center justify-center text-gray-400 hover:text-gray-700 rounded-full hover:bg-gray-200"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-sm font-medium mb-1">用户名</label>
+                <input
+                  type="text"
+                  value={loginUser}
+                  onChange={(e) => setLoginUser(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleAdminLogin()}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  placeholder="输入管理员用户名"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">密码</label>
+                <input
+                  type="password"
+                  value={loginPass}
+                  onChange={(e) => setLoginPass(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleAdminLogin()}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  placeholder="输入密码"
+                />
+              </div>
+              {loginError && (
+                <p className="text-red-500 text-sm">{loginError}</p>
+              )}
+              <button
+                onClick={handleAdminLogin}
+                disabled={loginLoading}
+                className="w-full py-2.5 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:bg-gray-300 font-medium transition-colors"
+              >
+                {loginLoading ? "登录中..." : "登录"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </main>
   );
