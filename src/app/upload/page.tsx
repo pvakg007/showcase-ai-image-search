@@ -5,7 +5,7 @@ import PreviewModal from "../components/PreviewModal";
 
 /** 常用空间名称预选项 */
 const PRESET_SPACES = [
-  "客厅", "餐厅", "主卧", "书房", "厨房",
+  "客厅", "餐厅", "主卧", "卧室", "书房", "厨房",
   "玄关", "阳台", "衣帽间", "儿童房", "茶室", "工装", "榻榻米",
 ];
 
@@ -115,7 +115,7 @@ export default function UploadPage() {
   }, []);
 
   // ============ 客户端预压缩（移动端也要保证小体积，避免 Vercel 超时）============
-  async function compressImageClient(file: File, maxWidth = 1280, quality = 0.72): Promise<File> {
+  async function compressImageClient(file: File, maxWidth = 1280, quality = 0.86): Promise<File> {
     return new Promise(function (resolve, reject) {
       var img = new Image();
       img.onload = function () {

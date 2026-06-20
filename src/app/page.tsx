@@ -211,12 +211,6 @@ export default function Home() {
             >
               清除筛选
             </button>
-            <a
-              href="/upload"
-              className="px-4 py-2 bg-blue-500 text-white hover:bg-blue-600 rounded-lg transition-colors"
-            >
-              上传图片
-            </a>
             <button
               onClick={() => setShowLogin(true)}
               className="px-4 py-2 bg-gray-100 text-gray-700 hover:bg-gray-200 rounded-lg transition-colors text-sm"

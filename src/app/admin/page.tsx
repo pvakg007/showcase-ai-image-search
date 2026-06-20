@@ -381,6 +381,13 @@ export default function AdminPage() {
     });
   };
 
+  var formatBytes = function (n: number) {
+    if (!n) return "0B";
+    if (n < 1024) return n + "B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(0) + "KB";
+    return (n / 1024 / 1024).toFixed(2) + "MB";
+  };
+
   // ===== 未登录 → 登录/首次设置页面 =====
   if (!authenticated) {
     return (
@@ -489,6 +496,12 @@ export default function AdminPage() {
                 共 {stats.totalImages} 张图片 · COS {stats.cosFiles.totalSizeFormatted}
               </span>
             )}
+            <a
+              href="/upload"
+              className="px-3 py-1 text-sm bg-green-500 text-white hover:bg-green-600 rounded transition-colors"
+            >
+              ＋ 上传图片
+            </a>
             <button
               onClick={loadStats}
               className="px-3 py-1 text-sm bg-gray-100 hover:bg-gray-200 rounded transition-colors"
@@ -636,33 +649,61 @@ export default function AdminPage() {
                     job.status === "failed" ? "失败" :
                     job.status === "processing" ? "处理中" :
                     job.status === "pending" ? "等待中" : "重试中";
+                  var title = job.projectName || ("任务 " + String(job.id).slice(-8));
+                  var compressedNote = (job.compressedCount > 0)
+                    ? "已压缩/转换 " + job.compressedCount + "/" + job.totalImages
+                    : "未压缩";
                   return (
-                    <div key={job.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg text-sm">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className={"px-2 py-0.5 rounded text-xs font-medium " + statusColor}>
+                    <div key={job.id} className="p-3 bg-gray-50 rounded-lg text-sm">
+                      {/* 行1：状态 + 项目名 + 时间 */}
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className={"px-2 py-0.5 rounded text-xs font-medium flex-shrink-0 " + statusColor}>
                             {statusLabel}
                           </span>
-                          <span className="font-medium truncate">{job.projectName || job.id.substring(job.id.length - 8)}</span>
-                          <span className="text-gray-400 text-xs">{job.type}</span>
+                          <span className="font-medium truncate">{title}</span>
+                          <span className="text-gray-400 text-xs flex-shrink-0">{job.type}</span>
                         </div>
-                        <div className="text-gray-500 text-xs mt-1">
-                          {job.processed}/{job.totalImages} 处理完成
-                          {job.failed > 0 ? "（" + job.failed + " 失败）" : ""}
-                          {job.retryCount > 0 ? " · 重试 " + job.retryCount + "/" + job.maxRetries : ""}
-                          <span className="ml-2">{formatTime(job.createdAt)}</span>
+                        <div className="flex items-center gap-1 flex-shrink-0">
+                          {job.status === "failed" && (
+                            <button
+                              onClick={function () { retryJob(job.id); }}
+                              className="px-2.5 py-1 text-xs bg-red-100 text-red-700 rounded hover:bg-red-200 transition-colors"
+                            >
+                              重试
+                            </button>
+                          )}
                         </div>
                       </div>
-                      <div className="flex gap-1 flex-shrink-0 ml-2">
-                        {job.status === "failed" && (
-                          <button
-                            onClick={function () { retryJob(job.id); }}
-                            className="px-2.5 py-1 text-xs bg-red-100 text-red-700 rounded hover:bg-red-200 transition-colors"
-                          >
-                            重试
-                          </button>
-                        )}
+                      {/* 行2：统计信息 */}
+                      <div className="text-gray-500 text-xs mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5">
+                        <span>🕐 {formatTime(job.createdAt)}</span>
+                        <span>📊 {job.processed}/{job.totalImages} 成功{job.failed > 0 ? " · " + job.failed + " 失败" : ""}</span>
+                        {job.retryCount > 0 && <span>🔁 重试 {job.retryCount}/{job.maxRetries}</span>}
+                        <span>🗜 {compressedNote}</span>
+                        {job.totalFinalSize > 0 && <span>📦 总 {formatBytes(job.totalFinalSize)}</span>}
                       </div>
+                      {/* 行3：文件明细 */}
+                      {Array.isArray(job.files) && job.files.length > 0 && (
+                        <div className="mt-2 space-y-1">
+                          {job.files.map(function (f: any, fi: number) {
+                            var fstat = f.status === "success" ? "✓" : f.status === "failed" ? "✗" : "⋯";
+                            var fcolor = f.status === "success" ? "text-green-600" : f.status === "failed" ? "text-red-600" : "text-gray-400";
+                            var spaces = (f.spaceNames && f.spaceNames.length) ? " · " + f.spaceNames.join("、") : "";
+                            return (
+                              <div key={fi} className="flex items-center gap-2 text-xs text-gray-600 pl-1">
+                                <span className={fcolor + " flex-shrink-0"}>{fstat}</span>
+                                <span className="truncate flex-1">{(f.originalName || "未命名") + spaces}</span>
+                                {f.finalSize > 0 && <span className="text-gray-400 flex-shrink-0">{formatBytes(f.finalSize)}</span>}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                      {/* 失败错误信息 */}
+                      {job.status === "failed" && job.error && (
+                        <div className="mt-1.5 text-xs text-red-500 bg-red-50 rounded px-2 py-1 break-all">错误：{job.error}</div>
+                      )}
                     </div>
                   );
                 })}

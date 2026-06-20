@@ -57,13 +57,24 @@ export async function GET(req) {
     );
 
     var jobs = (res.data.hits || []).map(function (j) {
-      var total = (j.files || []).length;
-      var done = (j.results || []).filter(function (r) { return r && r.status === "success"; }).length;
-      var failed = (j.results || []).filter(function (r) { return r && r.status === "failed"; }).length;
+      var files = j.files || [];
+      var results = j.results || [];
+      var total = files.length;
+      var done = results.filter(function (r) { return r && r.status === "success"; }).length;
+      var failed = results.filter(function (r) { return r && r.status === "failed"; }).length;
+
+      // 总最终大小（字节）
+      var totalFinalSize = files.reduce(function (acc, f) {
+        return acc + (f.compressedSize || f.originalSize || 0);
+      }, 0);
+      // 是否所有文件都已处理（有 compressedSize 视为已压缩/转换过）
+      var compressedCount = files.filter(function (f) { return !!f.compressedKey; }).length;
+
       return {
         id: j.id,
         type: j.type,
         status: j.status,
+        error: j.error || "",
         projectName: j.projectName || "",
         totalImages: total,
         processed: done,
@@ -74,13 +85,21 @@ export async function GET(req) {
         processingLock: j.processingLock || 0,
         createdAt: j.createdAt,
         updatedAt: j.updatedAt,
-        files: (j.files || []).map(function (f, fi) {
-          var r = (j.results || [])[fi];
+        totalFinalSize: totalFinalSize,
+        compressedCount: compressedCount,
+        // 可搜索的文件名（成功结果的标题）
+        resultTitles: results
+          .filter(function (r) { return r && r.status === "success" && r.title; })
+          .map(function (r) { return r.title; }),
+        files: files.map(function (f, fi) {
+          var r = results[fi];
           return {
             originalName: f.originalName,
             spaceNames: f.spaceNames || [],
             status: r ? r.status : "pending",
             error: r ? r.error || "" : "",
+            finalSize: f.compressedSize || f.originalSize || 0,
+            converted: !!f.compressedKey,
           };
         }),
       };

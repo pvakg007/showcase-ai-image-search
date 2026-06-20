@@ -378,8 +378,15 @@ export async function runPipeline(job, opts) {
   var heartbeat = opts.heartbeat || function () {};
   var jobId = job.id;
   var files = job.files || [];
+
+  // ===== 逐步日志：相对启动时间的毫秒数，便于定位卡在哪一步 =====
+  var pipeStart = Date.now();
+  function plog(msg) { console.log("[pipe +" + (Date.now() - pipeStart) + "ms] job=" + jobId + " " + msg); }
+  plog("启动流水线，共 " + files.length + " 张图片，模式=" + (opts.onEvent ? "stream" : "background"));
+
   var cos = await makeCos();
   var aiSettings = await readAiSettings(cos);
+  plog("读取 AI 设置完成: model=" + aiSettings.aiModel + " url=" + (aiSettings.aiUrl || "(空)"));
   var bucketDomain = (process.env.COS_BUCKET || "") + ".cos." + (process.env.COS_REGION || "") + ".myqcloud.com";
 
   var results = Array.isArray(job.results) ? job.results.slice() : [];
@@ -387,6 +394,7 @@ export async function runPipeline(job, opts) {
   // ============ Phase 1: 下载 + 压缩（并行 + 断点续跑 + 合并 checkpoint）============
   // 并行处理所有图片，避免逐张串行 + 逐张写 Meilisearch 导致移动端 5 图超时。
   heartbeat();
+  plog("Phase1 开始：下载+压缩（并行 " + files.length + "）");
   var updatedFiles = (job.files || []).slice(); // 副本，最后一次性写回
 
   var imageList = await Promise.all(files.map(function (fi, i) {
@@ -420,23 +428,28 @@ export async function runPipeline(job, opts) {
 
       onEvent("stage", { stage: "downloading", index: i + 1, total: files.length });
       try {
+        var dlT0 = Date.now();
         var dlData = await new Promise(function (resolve, reject) {
           cos.getObject({ Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION, Key: fi.cosKey },
             function (err, d) { if (err) reject(err); else resolve(d); });
         });
         var buf = Buffer.isBuffer(dlData.Body) ? dlData.Body : Buffer.from(dlData.Body);
         var originalSize = buf.length;
+        plog("图" + (i + 1) + " 下载完成: " + originalSize + "B (" + (Date.now() - dlT0) + "ms)");
 
         onEvent("stage", { stage: "compressing", index: i + 1, total: files.length });
         var comp = await compressImage(buf);
+        plog("图" + (i + 1) + " 压缩完成: " + originalSize + "B → " + comp.compressedSize + "B (sharp=" + comp.sharpUsed + ")");
         var compressedKey = fi.cosKey.replace(/^temp\//, "images/").replace(/\.[^.]+$/, ".jpg");
 
+        var putT0 = Date.now();
         await new Promise(function (resolve, reject) {
           cos.putObject({
             Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION,
             Key: compressedKey, Body: comp.buffer, ACL: "public-read", ContentType: "image/jpeg",
           }, function (err) { if (err) reject(err); else resolve(); });
         });
+        plog("图" + (i + 1) + " 上传压缩版完成 (" + (Date.now() - putT0) + "ms)");
 
         // 删除临时原图
         cos.deleteObject({ Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION, Key: fi.cosKey }, function () {});
@@ -459,7 +472,7 @@ export async function runPipeline(job, opts) {
           sharpUsed: comp.sharpUsed, error: null,
         };
       } catch (err) {
-        console.warn("[process] 图片处理失败 " + (i + 1) + ":", err.message);
+        plog("图" + (i + 1) + " 处理失败: " + err.message);
         onEvent("stage", { stage: "compress_failed", index: i + 1, total: files.length, error: err.message });
         return { compressed: null, compressedKey: "", url: "", spaceNames: fi.spaceNames || [], idx: i, error: err.message };
       }
@@ -470,8 +483,9 @@ export async function runPipeline(job, opts) {
   try {
     await updateJob(jobId, { files: updatedFiles });
     job.files = updatedFiles;
+    plog("Phase1 完成：checkpoint 已写回（" + updatedFiles.length + " 文件）");
   } catch (err) {
-    console.warn("[process] checkpoint 写回失败:", err.message);
+    plog("Phase1 checkpoint 写回失败（不阻塞）: " + err.message);
   }
   heartbeat();
 
@@ -483,9 +497,11 @@ export async function runPipeline(job, opts) {
   if (analysisRaw) {
     // 断点续跑：已有 AI 结果 → 直接复用，跳过 AI 调用
     analysis = tryParseJson(analysisRaw);
+    plog("Phase2 跳过：复用已保存 AI 结果（断点续跑）");
     onEvent("stage", { stage: "ai_resumed", note: "复用已保存的 AI 结果，跳过调用" });
   } else {
     var validImages = imageList.filter(function (x) { return !x.error; });
+    plog("Phase2 开始：AI 调用，有效图片 " + validImages.length + "/" + imageList.length);
     var promptContent = await readPrompt(cos, aiSettings);
     if (!promptContent) {
       promptContent = getDefaultPrompt();
@@ -513,6 +529,7 @@ export async function runPipeline(job, opts) {
         });
       }
     }
+    plog("Phase2 构建请求完成: payload=" + payloadBytes + "B (" + (payloadBytes / 1024 / 1024).toFixed(2) + "MB)，提交到 " + chatUrl);
 
     var openaiBody = { model: aiSettings.aiModel, stream: true, max_tokens: 8192, messages: messages };
     var openaiHeaders = {
@@ -523,15 +540,18 @@ export async function runPipeline(job, opts) {
 
     onEvent("ai_submit", { totalImages: validImages.length, payloadBytes: payloadBytes, model: aiSettings.aiModel });
     heartbeat();
+    var aiT0 = Date.now();
 
     var streamResult = await streamAiResponse(chatUrl, openaiBody, openaiHeaders, {
-      onFirstFrame: function (ms) { onEvent("first_frame", { elapsedMs: ms }); firstFrameMs = ms; },
+      onFirstFrame: function (ms) { plog("Phase2 AI 首帧到达: " + ms + "ms"); onEvent("first_frame", { elapsedMs: ms }); firstFrameMs = ms; },
       onChunk: function (delta) { onEvent("content", { chunk: delta }); heartbeat(); },
       onTailWait: function (elapsedSec, sinceFirstSec) { onEvent("tail_wait", { elapsedSec: elapsedSec, sinceFirstSec: sinceFirstSec }); },
     });
+    plog("Phase2 AI 调用返回: " + (streamResult && streamResult.content ? "成功 " + streamResult.content.length + "字符" : "失败 " + (streamResult && streamResult.error)) + " (总" + (Date.now() - aiT0) + "ms)");
 
     if (!streamResult || !streamResult.content) {
       var aiErr = (streamResult && streamResult.error) || "AI 分析未返回有效内容";
+      plog("Phase2 失败，终止: " + aiErr);
       onEvent("error", { stage: "ai", message: aiErr });
       return { success: false, results: results, error: aiErr };
     }
@@ -548,11 +568,13 @@ export async function runPipeline(job, opts) {
   }
 
   // ============ Phase 3: 逐图写结果（MD / JSON / 索引，幂等）============
+  plog("Phase3 开始：逐图写结果（" + imageList.length + " 张）");
   for (var j = 0; j < imageList.length; j++) {
     heartbeat();
     var img2 = imageList[j];
     if (img2.error) {
       results[j] = { imageIndex: j, status: "failed", error: img2.error, spaceNames: img2.spaceNames };
+      plog("图" + (j + 1) + " 跳过（有错误）");
       onEvent("image_done", { index: j + 1, total: imageList.length, status: "failed", error: img2.error });
       continue;
     }
@@ -575,7 +597,7 @@ export async function runPipeline(job, opts) {
         }, function (err) { if (err) reject(err); else resolve(); });
       });
     } catch (err) {
-      console.warn("MD 写入失败:", err.message);
+      plog("图" + (j + 1) + " MD 写入失败: " + err.message);
     }
     var mdUrl = "https://" + bucketDomain + "/" + mdKey;
 
@@ -610,10 +632,12 @@ export async function runPipeline(job, opts) {
       title: searchFields.title, summary: searchFields.summary,
       tags: searchFields.tags, mdUrl: mdUrl, url: img2.url, spaceNames: img2.spaceNames,
     };
+    plog("图" + (j + 1) + " 结果写入完成: " + searchFields.title);
     onEvent("image_done", { index: j + 1, total: imageList.length, status: "success", title: searchFields.title });
   }
 
   var allSuccess = results.every(function (r) { return r && r.status === "success"; });
+  plog("流水线结束: " + (allSuccess ? "全部成功" : "部分失败") + " (总耗时 " + (Date.now() - pipeStart) + "ms)");
   return { success: allSuccess, results: results, error: allSuccess ? null : "部分图片处理失败" };
 }
 

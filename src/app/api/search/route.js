@@ -51,26 +51,41 @@ export async function POST(req) {
     var limit = 20;
     var offset = (pageNum - 1) * limit;
 
-    // 支持逗号分隔的多关键词：所有词必须同时匹配（AND 逻辑）
-    var query = q || "";
-    var hasComma = /[,，]/.test(query);
-    if (hasComma) {
-      query = query.replace(/[,，]+/g, " ").trim();
-    }
+    // 归一化分隔符（逗号/顿号）为空格，再按空格分词
+    var normalized = String(q || "").replace(/[,，、]+/g, " ").trim();
+    var tokens = normalized.split(/\s+/).filter(Boolean);
+
+    // 分离正向词与负向词（- 开头 → 排除该词）
+    var positive = [];
+    var negative = [];
+    tokens.forEach(function (t) {
+      if (t.charAt(0) === "-" && t.length > 1) negative.push(t.slice(1));
+      else if (t !== "-") positive.push(t);
+    });
+
+    var query = positive.join(" ").trim();
 
     var searchParams = {
-      q: query || "",
+      q: query,
       limit: limit,
       offset: offset,
       attributesToSearchOn: ["title", "summary", "tags", "spaceName", "projectName"],
     };
 
-    if (hasComma && query) {
+    // 多正向词要求全部匹配 (AND)
+    if (positive.length > 1) {
       searchParams.matchingStrategy = "all";
     }
 
-    if (filter) {
-      searchParams.filter = filter;
+    // 组合 filter：客户端选中的 tag filter + 负向排除 (NOT tags = "词")
+    var filterParts = [];
+    if (filter) filterParts.push(filter);
+    negative.forEach(function (w) {
+      // 排除 tags 中含有该词的图片
+      filterParts.push('NOT tags = "' + w.replace(/"/g, "") + '"');
+    });
+    if (filterParts.length > 0) {
+      searchParams.filter = filterParts.join(" AND ");
     }
 
     const res = await doSearch(searchParams);
