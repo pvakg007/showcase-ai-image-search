@@ -115,6 +115,13 @@ export async function GET(req) {
   var limit = parseInt(req.nextUrl.searchParams.get("limit")) || 50;
   var offset = (page - 1) * limit;
 
+  // 幂等确保新字段可搜索（fire-and-forget 自愈）
+  axios.patch(
+    process.env.MEILISEARCH_HOST + "/indexes/design_images/settings",
+    { searchableAttributes: ["title", "summary", "tags", "spaceName", "projectName", "spaceNames"] },
+    { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
+  ).catch(function () {});
+
   try {
     var searchParams = {
       q: q || "",
@@ -132,12 +139,24 @@ export async function GET(req) {
           "Content-Type": "application/json",
         },
       }
-    );
+    ).catch(function (err) {
+      // attributesToSearchOn 引发 400（字段尚未可搜索）→ 回退全字段
+      if (err.response && err.response.status === 400) {
+        var fallback = Object.assign({}, searchParams);
+        delete fallback.attributesToSearchOn;
+        return axios.post(
+          process.env.MEILISEARCH_HOST + "/indexes/design_images/search",
+          fallback,
+          { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
+        );
+      }
+      throw err;
+    });
 
     return Response.json({
       success: true,
       data: res.data.hits || [],
-      total: res.data.estimatedTotalHits || res.data.hits?.length || 0,
+      total: res.data.estimatedTotalHits || (res.data.hits && res.data.hits.length) || 0,
       page: page,
       limit: limit,
     });

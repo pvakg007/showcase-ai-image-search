@@ -10,5 +10,9 @@ next-env.d.ts
 .DS_Store
 提示词.txt
 
+# package-lock.json 必须忽略：本机 Windows 生成会锁定 win32 sharp 二进制，
+# 导致 Vercel(linux) 上 sharp 的 libvips.so 缺失。让 Vercel 用 npm install 自行解析平台二进制。
+package-lock.json
+
 .vercel
 .env*
