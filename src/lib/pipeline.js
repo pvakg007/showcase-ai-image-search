@@ -23,7 +23,7 @@ import fs from "fs";
 // 工具函数
 // ============================================================
 
-function tryParseJson(text) {
+export function tryParseJson(text) {
   if (!text) return null;
   try { return JSON.parse(text); } catch (_) {}
   var m = text.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -46,14 +46,25 @@ function stableDocId(jobId, imageIndex) {
 /**
  * 提取搜索字段（title / summary / tags）
  * imageIndex: 1-based。批量模式下只提取匹配 (图N) 的空间数据
+ * spaceNames: 用户标注的空间名称数组，追加到标题末尾
+ *
+ * 关键词规则（用户定义）：
+ *   - 不取「设计手法」(designTechniques)
+ *   - 「色彩·核心应用」(coreApplication)：仅按 + 号分段；/ , ， 等不算分隔符
+ *   - 「运用材质」(materials)：全部
+ *   - 「软装单品」(softDecorationItems.itemName)：全部
  */
-function extractSearchFields(analysis, imageIndex) {
+export function extractSearchFields(analysis, imageIndex, spaceNames) {
   var title = "未命名图片", summary = "暂无总结", tags = [];
   try {
     var sd = analysis && analysis.styleDefinition;
     var oes = analysis && analysis.overallEmotionalStyle;
     var cds = analysis && analysis.colorDesignSummary;
     if (sd && sd.coreStyle) title = sd.coreStyle;
+    // 标题追加用户标注的空间名称
+    if (Array.isArray(spaceNames) && spaceNames.length > 0) {
+      title = title + "，" + spaceNames.join("、");
+    }
     var parts = [];
     if (oes && oes.coreTemperament) parts.push("核心气质：" + oes.coreTemperament);
     if (Array.isArray(oes && oes.detailedInterpretation)) parts.push.apply(parts, oes.detailedInterpretation);
@@ -65,8 +76,13 @@ function extractSearchFields(analysis, imageIndex) {
         var c = t.trim(); if (c) tagSet.add(c);
       });
     };
-    if (sd) { splitInto(sd.coreStyle); splitInto(sd.designTechniques); splitInto(sd.emotionalTone); }
-    if (cds && cds.coreApplication) splitInto(cds.coreApplication);
+    if (sd) { splitInto(sd.coreStyle); splitInto(sd.emotionalTone); } // 不取 designTechniques
+    // 核心应用：仅按 + 号分段（/ , ， 不算分隔符）
+    if (cds && cds.coreApplication) {
+      String(cds.coreApplication).split("+").forEach(function (t) {
+        var c = t.trim(); if (c) tagSet.add(c);
+      });
+    }
     if (Array.isArray(analysis && analysis.spaceSoftDecorationAnalysis)) {
       analysis.spaceSoftDecorationAnalysis.forEach(function (s) {
         if (imageIndex) {
@@ -87,7 +103,7 @@ function extractSearchFields(analysis, imageIndex) {
 /**
  * 构建单张图的 Markdown（imageIndex 过滤属于该图的空间）
  */
-function buildMarkdown(analysis, imageUrl, timestamp, spaceNames, imageIndex) {
+export function buildMarkdown(analysis, imageUrl, timestamp, spaceNames, imageIndex) {
   var lines = [];
   try {
     var sd = analysis && analysis.styleDefinition;
@@ -180,7 +196,7 @@ function buildMarkdown(analysis, imageUrl, timestamp, spaceNames, imageIndex) {
  * 服务端图片处理：透传 buffer（浏览器已在上传前压缩到 1600px JPEG），仅测量尺寸。
  * 返回 { buffer, originalSize, compressedSize, sharpUsed }
  */
-async function compressImage(buffer) {
+export async function compressImage(buffer) {
   var size = buffer.length;
   return { buffer: buffer, originalSize: size, compressedSize: size, sharpUsed: false };
 }
@@ -193,7 +209,7 @@ async function makeCos() {
   return new COS({ SecretId: process.env.COS_SECRET_ID, SecretKey: process.env.COS_SECRET_KEY });
 }
 
-async function readAiSettings(cos) {
+export async function readAiSettings(cos) {
   var aiUrl = process.env.SPARK_API_URL || "";
   var aiModel = process.env.SPARK_MODEL || "qwen3.6-plus";
   var aiKey = process.env.SPARK_API_KEY || process.env.DASHSCOPE_API_KEY || "";
@@ -234,7 +250,7 @@ async function readPrompt(cos, aiSettings) {
  *   - onFirstFrame(ms)     首帧到达
  *   - onTailWait(elapsedSec, sinceFirstSec)  读秒心跳（每秒一次，首帧后开始）
  */
-async function streamAiResponse(url, body, headers, opts) {
+export async function streamAiResponse(url, body, headers, opts) {
   opts = opts || {};
   var onChunk = opts.onChunk || function () {};
   var onFirstFrame = opts.onFirstFrame || function () {};
@@ -368,93 +384,96 @@ export async function runPipeline(job, opts) {
 
   var results = Array.isArray(job.results) ? job.results.slice() : [];
 
-  // ============ Phase 1: 下载 + 压缩（带断点续跑）============
-  var imageList = []; // { compressed, compressedKey, url, spaceNames, idx, originalSize, compressedSize, sharpUsed, error }
-  for (var i = 0; i < files.length; i++) {
-    heartbeat();
-    var fi = files[i];
-    if (!fi || !fi.cosKey) {
-      imageList.push({ compressed: null, compressedKey: "", url: "", spaceNames: (fi && fi.spaceNames) || [], idx: i, error: "缺少 COS key" });
-      onEvent("stage", { stage: "skip", index: i + 1, total: files.length, reason: "缺少 COS key" });
-      continue;
-    }
+  // ============ Phase 1: 下载 + 压缩（并行 + 断点续跑 + 合并 checkpoint）============
+  // 并行处理所有图片，避免逐张串行 + 逐张写 Meilisearch 导致移动端 5 图超时。
+  heartbeat();
+  var updatedFiles = (job.files || []).slice(); // 副本，最后一次性写回
 
-    // 断点续跑：已有 compressedKey → 直接从 images/ 下载已压缩版（不再压缩）
-    if (fi.compressedKey) {
-      onEvent("stage", { stage: "resuming", index: i + 1, total: files.length });
+  var imageList = await Promise.all(files.map(function (fi, i) {
+    return (async function () {
+      if (!fi || !fi.cosKey) {
+        onEvent("stage", { stage: "skip", index: i + 1, total: files.length, reason: "缺少 COS key" });
+        return { compressed: null, compressedKey: "", url: "", spaceNames: (fi && fi.spaceNames) || [], idx: i, error: "缺少 COS key" };
+      }
+
+      // 断点续跑：已有 compressedKey → 直接从 images/ 下载已压缩版（不再压缩）
+      if (fi.compressedKey) {
+        onEvent("stage", { stage: "resuming", index: i + 1, total: files.length });
+        try {
+          var resumeData = await new Promise(function (resolve, reject) {
+            cos.getObject({ Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION, Key: fi.compressedKey },
+              function (err, d) { if (err) reject(err); else resolve(d); });
+          });
+          var resumeBuf = Buffer.isBuffer(resumeData.Body) ? resumeData.Body : Buffer.from(resumeData.Body);
+          onEvent("compressed", { index: i + 1, total: files.length, originalSize: fi.originalSize || resumeBuf.length, compressedSize: resumeBuf.length, sharp: true });
+          return {
+            compressed: resumeBuf, compressedKey: fi.compressedKey,
+            url: "https://" + bucketDomain + "/" + fi.compressedKey,
+            spaceNames: fi.spaceNames || [], idx: i,
+            originalSize: fi.originalSize || resumeBuf.length, compressedSize: resumeBuf.length,
+            sharpUsed: true, error: null,
+          };
+        } catch (err) {
+          console.warn("[resume] 已压缩版丢失，回退重压缩:", fi.compressedKey, err.message);
+        }
+      }
+
+      onEvent("stage", { stage: "downloading", index: i + 1, total: files.length });
       try {
-        var resumeData = await new Promise(function (resolve, reject) {
-          cos.getObject({ Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION, Key: fi.compressedKey },
+        var dlData = await new Promise(function (resolve, reject) {
+          cos.getObject({ Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION, Key: fi.cosKey },
             function (err, d) { if (err) reject(err); else resolve(d); });
         });
-        var resumeBuf = Buffer.isBuffer(resumeData.Body) ? resumeData.Body : Buffer.from(resumeData.Body);
-        imageList.push({
-          compressed: resumeBuf, compressedKey: fi.compressedKey,
-          url: "https://" + bucketDomain + "/" + fi.compressedKey,
+        var buf = Buffer.isBuffer(dlData.Body) ? dlData.Body : Buffer.from(dlData.Body);
+        var originalSize = buf.length;
+
+        onEvent("stage", { stage: "compressing", index: i + 1, total: files.length });
+        var comp = await compressImage(buf);
+        var compressedKey = fi.cosKey.replace(/^temp\//, "images/").replace(/\.[^.]+$/, ".jpg");
+
+        await new Promise(function (resolve, reject) {
+          cos.putObject({
+            Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION,
+            Key: compressedKey, Body: comp.buffer, ACL: "public-read", ContentType: "image/jpeg",
+          }, function (err) { if (err) reject(err); else resolve(); });
+        });
+
+        // 删除临时原图
+        cos.deleteObject({ Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION, Key: fi.cosKey }, function () {});
+
+        // 记录到副本（合并 checkpoint，最后统一写一次）
+        updatedFiles[i] = Object.assign({}, fi, {
+          compressedKey: compressedKey, originalSize: originalSize, compressedSize: comp.compressedSize,
+        });
+
+        onEvent("compressed", {
+          index: i + 1, total: files.length,
+          originalSize: originalSize, compressedSize: comp.compressedSize, sharp: comp.sharpUsed,
+        });
+
+        return {
+          compressed: comp.buffer, compressedKey: compressedKey,
+          url: "https://" + bucketDomain + "/" + compressedKey,
           spaceNames: fi.spaceNames || [], idx: i,
-          originalSize: fi.originalSize || resumeBuf.length, compressedSize: resumeBuf.length,
-          sharpUsed: true, error: null,
-        });
-        continue;
+          originalSize: originalSize, compressedSize: comp.compressedSize,
+          sharpUsed: comp.sharpUsed, error: null,
+        };
       } catch (err) {
-        // 已压缩版丢了 → 回退到重新下载+压缩
-        console.warn("[resume] 已压缩版丢失，回退重压缩:", fi.compressedKey, err.message);
+        console.warn("[process] 图片处理失败 " + (i + 1) + ":", err.message);
+        onEvent("stage", { stage: "compress_failed", index: i + 1, total: files.length, error: err.message });
+        return { compressed: null, compressedKey: "", url: "", spaceNames: fi.spaceNames || [], idx: i, error: err.message };
       }
-    }
+    })();
+  }));
 
-    onEvent("stage", { stage: "downloading", index: i + 1, total: files.length });
-    try {
-      var dlData = await new Promise(function (resolve, reject) {
-        cos.getObject({ Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION, Key: fi.cosKey },
-          function (err, d) { if (err) reject(err); else resolve(d); });
-      });
-      var buf = Buffer.isBuffer(dlData.Body) ? dlData.Body : Buffer.from(dlData.Body);
-      var originalSize = buf.length;
-
-      onEvent("stage", { stage: "compressing", index: i + 1, total: files.length });
-      var comp = await compressImage(buf, 1600);
-      var compressedKey = fi.cosKey.replace(/^temp\//, "images/").replace(/\.[^.]+$/, ".jpg");
-
-      await new Promise(function (resolve, reject) {
-        cos.putObject({
-          Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION,
-          Key: compressedKey, Body: comp.buffer, ACL: "public-read", ContentType: "image/jpeg",
-        }, function (err) { if (err) reject(err); else resolve(); });
-      });
-
-      // 删除临时原图
-      cos.deleteObject({ Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION, Key: fi.cosKey }, function () {});
-
-      // 写入断点 checkpoint：压缩后的 key 存进 file 记录
-      var updatedFiles = (job.files || []).map(function (f, idx) {
-        if (idx !== i) return f;
-        return Object.assign({}, f, {
-          compressedKey: compressedKey,
-          originalSize: originalSize,
-          compressedSize: comp.compressedSize,
-        });
-      });
-      await updateJob(jobId, { files: updatedFiles });
-      job.files = updatedFiles;
-
-      onEvent("compressed", {
-        index: i + 1, total: files.length,
-        originalSize: originalSize, compressedSize: comp.compressedSize, sharp: comp.sharpUsed,
-      });
-
-      imageList.push({
-        compressed: comp.buffer, compressedKey: compressedKey,
-        url: "https://" + bucketDomain + "/" + compressedKey,
-        spaceNames: fi.spaceNames || [], idx: i,
-        originalSize: originalSize, compressedSize: comp.compressedSize,
-        sharpUsed: comp.sharpUsed, error: null,
-      });
-    } catch (err) {
-      console.warn("[process] 图片处理失败 " + (i + 1) + ":", err.message);
-      imageList.push({ compressed: null, compressedKey: "", url: "", spaceNames: fi.spaceNames || [], idx: i, error: err.message });
-      onEvent("stage", { stage: "compress_failed", index: i + 1, total: files.length, error: err.message });
-    }
+  // 合并 checkpoint：一次性写回所有 compressedKey（替代之前的逐张写，省 N 次 Meilisearch 往返）
+  try {
+    await updateJob(jobId, { files: updatedFiles });
+    job.files = updatedFiles;
+  } catch (err) {
+    console.warn("[process] checkpoint 写回失败:", err.message);
   }
+  heartbeat();
 
   // ============ Phase 2: AI 调用（一次批量调用，带断点续跑）============
   var analysisRaw = job.aiRaw || null;
@@ -539,7 +558,7 @@ export async function runPipeline(job, opts) {
     }
 
     var imageIndex = j + 1; // 1-based，用于 (图N) 过滤
-    var searchFields = extractSearchFields(analysis, imageIndex);
+    var searchFields = extractSearchFields(analysis, imageIndex, img2.spaceNames);
     var docId = stableDocId(jobId, j);
     var ts = docId;
 

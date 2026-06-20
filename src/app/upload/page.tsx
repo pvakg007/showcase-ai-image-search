@@ -5,8 +5,8 @@ import PreviewModal from "../components/PreviewModal";
 
 /** 常用空间名称预选项 */
 const PRESET_SPACES = [
-  "客厅", "餐厅", "主卧", "次卧", "书房", "厨房", "卫生间",
-  "玄关", "阳台", "衣帽间", "儿童房", "茶室", "健身房", "影音室",
+  "客厅", "餐厅", "主卧", "书房", "厨房",
+  "玄关", "阳台", "衣帽间", "儿童房", "茶室", "工装", "榻榻米",
 ];
 
 interface FileItem {
@@ -114,8 +114,8 @@ export default function UploadPage() {
     setLogs(function (prev) { return prev.concat([{ type: type, text: text, ts: Date.now() }]); });
   }, []);
 
-  // ============ 客户端预压缩 ============
-  async function compressImageClient(file: File, maxWidth = 1600, quality = 0.8): Promise<File> {
+  // ============ 客户端预压缩（移动端也要保证小体积，避免 Vercel 超时）============
+  async function compressImageClient(file: File, maxWidth = 1280, quality = 0.72): Promise<File> {
     return new Promise(function (resolve, reject) {
       var img = new Image();
       img.onload = function () {
@@ -146,9 +146,8 @@ export default function UploadPage() {
     var loadedCount = 0;
     selectedFiles.forEach(async function (file, index) {
       var fileToUse = file;
-      if (file.type !== "image/jpeg" || file.size > 200 * 1024) {
-        try { fileToUse = await compressImageClient(file); } catch (_) {}
-      }
+      // 一律压缩（移动端照片普遍较大，不压缩会导致服务端超时）
+      try { fileToUse = await compressImageClient(file); } catch (_) {}
       var reader = new FileReader();
       reader.onload = function (event) {
         newItems[index] = { file: fileToUse, preview: (event.target?.result as string) || "", spaceNames: [] };
@@ -460,7 +459,7 @@ export default function UploadPage() {
                       <p className="text-sm text-gray-500 mb-2 truncate">{item.file.name}</p>
                       <label className="block text-sm font-medium mb-1">空间名称</label>
                       <input type="text" placeholder="点击预设标签选择" value={item.spaceNames.join("、")}
-                        onChange={function (e) { updateSpaceNames(index, e.target.value.split("、").map(function (s) { return s.trim(); }).filter(Boolean)); }}
+                        onChange={function (e) { updateSpaceNames(index, e.target.value.split(/[，,、]/).map(function (s) { return s.trim(); }).filter(Boolean)); }}
                         className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 mb-2" />
                       <div className="flex flex-wrap gap-1.5 mb-2">
                         {PRESET_SPACES.map(function (preset) {

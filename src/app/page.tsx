@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import PreviewModal from "./components/PreviewModal";
 
 interface ImageItem {
@@ -35,10 +35,21 @@ export default function Home() {
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
 
-  // 翻页
+  // 翻页（初始页在 mount 时从 URL ?page=N 读取，刷新后保持）
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   const perPage = 20;
+
+  // 请求令牌：丢弃过期响应，避免翻页+搜索竞争时显示错页
+  const fetchTokenRef = useRef(0);
+
+  // mount 时从 URL 读取初始页码（刷新保持页码）
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      var p = parseInt(new URLSearchParams(window.location.search).get("page") || "1", 10) || 1;
+      if (p > 1) setPage(p);
+    }
+  }, []);
 
   // 预览弹窗状态
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -61,18 +72,26 @@ export default function Home() {
   // 页面加载时 fire-and-forget 触发后台工作进程，捡起遗留任务（断点续跑）
   useEffect(() => { fetch("/api/process-queue").catch(() => {}); }, []);
 
-  // 搜索条件变化时重置到第一页并搜索
+  // 搜索/标签变化 → 回到第 1 页（由下方 effect 统一拉取，避免重复请求）
   useEffect(() => {
     setPage(1);
-    fetchData(1);
   }, [debouncedSearchText, selectedTags]);
 
-  // 翻页时不重置条件
+  // 数据获取：page / 搜索 / 标签 任一变化都拉取（含点击回到第 1 页）
   useEffect(() => {
-    if (page > 1) fetchData(page);
-  }, [page]);
+    fetchData(page);
+    // 同步 URL，使刷新后保持当前页（不触发滚动/重渲染）
+    if (typeof window !== "undefined") {
+      var params = new URLSearchParams(window.location.search);
+      if (page > 1) params.set("page", String(page)); else params.delete("page");
+      var qs = params.toString();
+      window.history.replaceState(null, "", window.location.pathname + (qs ? "?" + qs : ""));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, debouncedSearchText, selectedTags]);
 
   const fetchData = async (pageNum?: number) => {
+    var token = ++fetchTokenRef.current;
     setLoading(true);
     try {
       var currentPage = pageNum || page;
@@ -94,13 +113,15 @@ export default function Home() {
       });
 
       const data = await res.json();
+      // 丢弃过期响应（用户在此请求返回前又翻页/搜索了）
+      if (token !== fetchTokenRef.current) return;
       setImages(data.hits || []);
       var total = data.estimatedTotalHits || 0;
       setTotalPages(Math.max(1, Math.ceil(total / perPage)));
     } catch (err) {
       console.error("搜索错误:", err);
     } finally {
-      setLoading(false);
+      if (token === fetchTokenRef.current) setLoading(false);
     }
   };
 
