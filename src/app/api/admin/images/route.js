@@ -47,6 +47,62 @@ function extractKey(url) {
   }
 }
 
+/**
+ * 删除单个图片文件 + Meilisearch 记录
+ */
+async function deleteSingleItem(id, url, mdUrl) {
+  var deleted = [];
+
+  // 1. 从 Meilisearch 删除
+  try {
+    await axios.delete(
+      process.env.MEILISEARCH_HOST + "/indexes/design_images/documents/" + id,
+      { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY } }
+    );
+    deleted.push("Meilisearch");
+  } catch (err) {
+    console.warn("Meilisearch 删除失败:", err.message);
+  }
+
+  // 2. 从 COS 删除图片
+  if (url) {
+    var imageKey = extractKey(url);
+    if (imageKey) {
+      try {
+        await new Promise(function (resolve, reject) {
+          cos.deleteObject(
+            { Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION, Key: imageKey },
+            function (err) { if (err) reject(err); else resolve(); }
+          );
+        });
+        deleted.push("图片文件");
+      } catch (err) {
+        console.warn("COS 图片删除失败:", err.message);
+      }
+    }
+  }
+
+  // 3. 从 COS 删除总结
+  if (mdUrl) {
+    var mdKey = extractKey(mdUrl);
+    if (mdKey) {
+      try {
+        await new Promise(function (resolve, reject) {
+          cos.deleteObject(
+            { Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION, Key: mdKey },
+            function (err) { if (err) reject(err); else resolve(); }
+          );
+        });
+        deleted.push("总结文件");
+      } catch (err) {
+        console.warn("COS 总结删除失败:", err.message);
+      }
+    }
+  }
+
+  return deleted;
+}
+
 // ============================================================
 //  GET — 搜索/列出所有图片
 // ============================================================
@@ -64,7 +120,7 @@ export async function GET(req) {
       q: q || "",
       limit: limit,
       offset: offset,
-      attributesToSearchOn: ["title", "summary", "tags"],
+      attributesToSearchOn: ["title", "summary", "tags", "spaceName", "projectName"],
     };
 
     var res = await axios.post(
@@ -135,7 +191,7 @@ export async function PUT(req) {
 }
 
 // ============================================================
-//  DELETE — 删除图片（从 Meilisearch + COS）
+//  DELETE — 删除图片（支持单张和批量）
 // ============================================================
 export async function DELETE(req) {
   var auth = req.headers.get("authorization");
@@ -143,81 +199,28 @@ export async function DELETE(req) {
 
   try {
     var body = await req.json();
-    var { id, url, mdUrl } = body;
+    var { id, url, mdUrl, items } = body;
 
+    // 批量删除
+    if (Array.isArray(items) && items.length > 0) {
+      var overallDeleted = [];
+      for (var item of items) {
+        var d = await deleteSingleItem(item.id, item.url, item.mdUrl);
+        overallDeleted.push.apply(overallDeleted, d);
+      }
+      return Response.json({
+        success: true,
+        message: "批量删除完成，共处理 " + items.length + " 项",
+        deleted: overallDeleted,
+      });
+    }
+
+    // 单张删除
     if (!id) {
-      return Response.json(
-        { success: false, error: "缺少 id" },
-        { status: 400 }
-      );
+      return Response.json({ success: false, error: "缺少 id" }, { status: 400 });
     }
 
-    var deleted = [];
-
-    // 1. 从 Meilisearch 删除
-    try {
-      await axios.delete(
-        process.env.MEILISEARCH_HOST + "/indexes/design_images/documents/" + id,
-        {
-          headers: {
-            Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY,
-          },
-        }
-      );
-      deleted.push("Meilisearch");
-    } catch (err) {
-      console.warn("Meilisearch 删除失败:", err.message);
-    }
-
-    // 2. 从 COS 删除图片
-    if (url) {
-      var imageKey = extractKey(url);
-      if (imageKey) {
-        try {
-          await new Promise(function (resolve, reject) {
-            cos.deleteObject(
-              {
-                Bucket: process.env.COS_BUCKET,
-                Region: process.env.COS_REGION,
-                Key: imageKey,
-              },
-              function (err) {
-                if (err) reject(err);
-                else resolve();
-              }
-            );
-          });
-          deleted.push("图片文件");
-        } catch (err) {
-          console.warn("COS 图片删除失败:", err.message);
-        }
-      }
-    }
-
-    // 3. 从 COS 删除总结
-    if (mdUrl) {
-      var mdKey = extractKey(mdUrl);
-      if (mdKey) {
-        try {
-          await new Promise(function (resolve, reject) {
-            cos.deleteObject(
-              {
-                Bucket: process.env.COS_BUCKET,
-                Region: process.env.COS_REGION,
-                Key: mdKey,
-              },
-              function (err) {
-                if (err) reject(err);
-                else resolve();
-              }
-            );
-          });
-          deleted.push("总结文件");
-        } catch (err) {
-          console.warn("COS 总结删除失败:", err.message);
-        }
-      }
-    }
+    var deleted = await deleteSingleItem(id, url, mdUrl);
 
     return Response.json({
       success: true,

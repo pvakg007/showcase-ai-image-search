@@ -3,7 +3,11 @@ import axios from "axios";
 
 export async function POST(req) {
   try {
-    const { q, filter } = await req.json();
+    const { q, filter, page } = await req.json();
+
+    var pageNum = parseInt(page) || 1;
+    var limit = 20;
+    var offset = (pageNum - 1) * limit;
 
     // 支持逗号分隔的多关键词：所有词必须同时匹配（AND 逻辑）
     var query = q || "";
@@ -15,8 +19,9 @@ export async function POST(req) {
 
     var searchParams = {
       q: query || "",
-      limit: 50,
-      attributesToSearchOn: ["title", "summary", "tags"],
+      limit: limit,
+      offset: offset,
+      attributesToSearchOn: ["title", "summary", "tags", "spaceName", "projectName"],
     };
 
     // 多关键词时要求所有词必须匹配 (AND)

@@ -121,7 +121,7 @@ export async function POST(req) {
         {
           searchableAttributes: ["id"],
           filterableAttributes: ["status", "retryCount", "maxRetries", "processingLock"],
-          sortableAttributes: ["createdAt"],
+          sortableAttributes: ["createdAt", "nextRetryAt"],
         },
         {
           headers: {

@@ -27,12 +27,14 @@ function tryParseJson(text) {
   return null;
 }
 
-function extractSearchFields(analysis) {
+function extractSearchFields(analysis, imageIndex) {
+  // imageIndex: 1-based. 如果提供，只提取匹配 (图N) 的空间数据
   var title = "未命名图片", summary = "暂无总结", tags = [];
   try {
     var sd = analysis?.styleDefinition;
     var oes = analysis?.overallEmotionalStyle;
-    if (sd?.coreStyle) title = sd.coreStyle + " 设计分析";
+    var cds = analysis?.colorDesignSummary;
+    if (sd?.coreStyle) title = sd.coreStyle;
     var parts = [];
     if (oes?.coreTemperament) parts.push("核心气质：" + oes.coreTemperament);
     if (Array.isArray(oes?.detailedInterpretation)) parts.push.apply(parts, oes.detailedInterpretation);
@@ -41,10 +43,24 @@ function extractSearchFields(analysis) {
     if (sd?.coreStyle) sd.coreStyle.split(/[、,，/\/\s]+/).forEach(function (t) { var c = t.trim(); if (c) tagSet.add(c); });
     if (sd?.designTechniques) sd.designTechniques.split(/[、,，/\/\s]+/).forEach(function (t) { var c = t.trim(); if (c) tagSet.add(c); });
     if (sd?.emotionalTone) sd.emotionalTone.split(/[、,，/\/\s]+/).forEach(function (t) { var c = t.trim(); if (c) tagSet.add(c); });
+    // 从 coreApplication 提取色彩体系关键词
+    if (cds?.coreApplication) {
+      cds.coreApplication.split(/[+、,，/\/\s]+/).forEach(function (t) {
+        var c = t.trim();
+        if (c) tagSet.add(c);
+      });
+    }
+    // 遍历空间列表，按 (图N) 过滤
     if (Array.isArray(analysis?.spaceSoftDecorationAnalysis)) {
       analysis.spaceSoftDecorationAnalysis.forEach(function (s) {
+        if (imageIndex) {
+          var suffix = "（图" + imageIndex + "）";
+          var suffixAlt = "(图" + imageIndex + ")";
+          if (!s?.spaceName || (s.spaceName.indexOf(suffix) === -1 && s.spaceName.indexOf(suffixAlt) === -1)) return;
+        }
         if (s?.spaceName) tagSet.add(s.spaceName);
         if (Array.isArray(s?.softDecorationItems)) s.softDecorationItems.forEach(function (i) { if (i?.itemName) tagSet.add(i.itemName); });
+        if (Array.isArray(s?.materials)) s.materials.forEach(function (m) { if (m) tagSet.add(m); });
       });
     }
     tags = Array.from(tagSet).slice(0, 15);
@@ -52,7 +68,8 @@ function extractSearchFields(analysis) {
   return { title: title, summary: summary, tags: tags };
 }
 
-function buildMarkdown(analysis, imageUrl, timestamp, spaceNames) {
+function buildMarkdown(analysis, imageUrl, timestamp, spaceNames, imageIndex) {
+  // imageIndex: 1-based. 如果提供，通过 (图N) 过滤空间
   var lines = [];
   try {
     var sd = analysis?.styleDefinition, oes = analysis?.overallEmotionalStyle;
@@ -93,17 +110,40 @@ function buildMarkdown(analysis, imageUrl, timestamp, spaceNames) {
       lines.push("");
     }
     if (Array.isArray(spaces) && spaces.length > 0) {
-      lines.push("## 空间软装分析", "");
-      spaces.forEach(function (space, si) {
-        lines.push("### " + (si + 1) + ". " + (space.spaceName || "未命名空间"));
-        if (space.functionalAdaptation) lines.push("- **功能适配**: " + space.functionalAdaptation);
-        if (space.hardwareBase) lines.push("- **硬装基础**: " + space.hardwareBase);
-        if (Array.isArray(space.softDecorationItems)) {
-          lines.push("", "**软装单品：**");
-          space.softDecorationItems.forEach(function (item) { lines.push("- **" + item.itemName + "**: " + item.matchingLogic); });
-        }
-        lines.push("");
-      });
+      // 按 (图N) 过滤：只展示属于当前图片的空间
+      var filteredSpaces = spaces;
+      if (imageIndex) {
+        var figSuffix = "（图" + imageIndex + "）";
+        var figSuffixAlt = "(图" + imageIndex + ")";
+        filteredSpaces = spaces.filter(function (sp) {
+          if (!sp.spaceName) return false;
+          return sp.spaceName.indexOf(figSuffix) !== -1 || sp.spaceName.indexOf(figSuffixAlt) !== -1;
+        });
+      } else if (Array.isArray(spaceNames) && spaceNames.length > 0) {
+        filteredSpaces = spaces.filter(function (sp) {
+          if (!sp.spaceName) return false;
+          return spaceNames.some(function (sn) {
+            return sp.spaceName.indexOf(sn) !== -1 || sn.indexOf(sp.spaceName) !== -1;
+          });
+        });
+      }
+      if (filteredSpaces.length > 0) {
+        lines.push("## 空间软装分析", "");
+        filteredSpaces.forEach(function (space, si) {
+          lines.push("### " + (si + 1) + ". " + (space.spaceName || "未命名空间"));
+          if (space.functionalAdaptation) lines.push("- **功能适配**: " + space.functionalAdaptation);
+          if (space.hardwareBase) lines.push("- **硬装基础**: " + space.hardwareBase);
+          if (Array.isArray(space.materials)) {
+            lines.push("", "**运用材质：**");
+            space.materials.forEach(function (mat) { lines.push("- " + mat); });
+          }
+          if (Array.isArray(space.softDecorationItems)) {
+            lines.push("", "**软装单品：**");
+            space.softDecorationItems.forEach(function (item) { lines.push("- **" + item.itemName + "**: " + item.matchingLogic); });
+          }
+          lines.push("");
+        });
+      }
     }
     if (Array.isArray(ideas) && ideas.length > 0) {
       lines.push("## 通用搭配思路", "");
@@ -140,6 +180,104 @@ async function compressImage(buffer, maxPx) {
 
 function extractKey(url) {
   try { return new URL(url).pathname.replace(/^\//, ""); } catch (_) { return null; }
+}
+
+// ============================================================
+// 流式 AI 调用（SSE + 首帧检测 + 单 URL）
+// ============================================================
+async function streamAiResponse(url, body, headers) {
+  var accumulatedContent = "";
+  var firstChunkReceived = false;
+  var FIRST_CHUNK_TIMEOUT = 15000;
+  var FULL_TIMEOUT = 120000;
+  var lastErrMsg = "";
+  var startTime = Date.now();
+
+  try {
+    var controller = new AbortController();
+    var fullTimeoutId = setTimeout(function () { controller.abort(); }, FULL_TIMEOUT);
+
+    var response = await fetch(url, {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      clearTimeout(fullTimeoutId);
+      var isAuth = response.status === 401 || response.status === 403;
+      var errText = "";
+      try { errText = await response.text(); } catch (_) {}
+      console.warn("[AI] HTTP 错误:", response.status, errText.substring(0, 300));
+      return { content: null, isAuthError: isAuth, error: "HTTP " + response.status + ": " + errText.substring(0, 200) };
+    }
+
+    if (!response.body) {
+      clearTimeout(fullTimeoutId);
+      return { content: null, isAuthError: false, error: "响应体为空" };
+    }
+
+    var reader = response.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = "";
+
+    var firstChunkTimer = setTimeout(function () {
+      if (!firstChunkReceived) {
+        try { reader.cancel(); } catch (_) {}
+        controller.abort();
+        lastErrMsg = "首帧超时（15s 内未收到数据）";
+      }
+    }, FIRST_CHUNK_TIMEOUT);
+
+    while (true) {
+      var readResult = await reader.read();
+      if (readResult.done) break;
+
+      var chunk = decoder.decode(readResult.value, { stream: true });
+      buffer += chunk;
+
+      var lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (var li = 0; li < lines.length; li++) {
+        var trimmed = lines[li].trim();
+        if (!trimmed) continue;
+        if (trimmed === "data: [DONE]") continue;
+        if (!trimmed.startsWith("data: ")) continue;
+
+        var jsonStr = trimmed.slice(6);
+        try {
+          var parsed = JSON.parse(jsonStr);
+          var delta = parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.message?.content || "";
+          if (delta) {
+            accumulatedContent += delta;
+            if (!firstChunkReceived) {
+              firstChunkReceived = true;
+              clearTimeout(firstChunkTimer);
+              console.log("[AI] ✅ 首帧已到达（" + (Date.now() - startTime) + "ms）");
+            }
+          }
+        } catch (_) {}
+      }
+    }
+
+    clearTimeout(firstChunkTimer);
+    clearTimeout(fullTimeoutId);
+
+    if (!accumulatedContent) {
+      return { content: null, isAuthError: false, error: "流式响应结束但未获得有效内容" };
+    }
+
+    console.log("[AI] ✅ 完整响应已接收（" + (Date.now() - startTime) + "ms, " + accumulatedContent.length + "字符）");
+    return { content: accumulatedContent, isAuthError: false, error: null };
+  } catch (err) {
+    clearTimeout(fullTimeoutId);
+    if (err.name === "AbortError") {
+      return { content: null, isAuthError: false, error: lastErrMsg || "请求超时（120s）" };
+    }
+    return { content: null, isAuthError: false, error: err.message };
+  }
 }
 
 /**
@@ -233,16 +371,12 @@ export async function POST(req) {
     var bucketDomain = (process.env.COS_BUCKET || "") + ".cos." + (process.env.COS_REGION || "") + ".myqcloud.com";
 
     // 5. 调用 AI
-    var FALLBACK_URLS = [
-      aiUrl,
-      "https://llm-28jx4qmqak31ymc9.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
-      "https://dashscope.aliyuncs.com/compatible-mode/v1",
-      "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
-      "https://ws-zwf60r4eps2lu9v2.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1",
-    ].filter(function (u) { return u && u.length > 0; });
+    // ========== 单 URL + 流式调用 ==========
+    var baseUrl = aiUrl.replace(/\/+$/, "");
+    var chatUrl = baseUrl.indexOf("/chat/completions") === -1 ? baseUrl + "/chat/completions" : baseUrl;
 
     var openaiBody = {
-      model: aiModel, max_tokens: 4096,
+      model: aiModel, stream: true, max_tokens: 4096,
       messages: [{
         role: "user",
         content: [
@@ -258,57 +392,23 @@ export async function POST(req) {
       "x-dashscope-api-key": aiKey,
     };
 
-    var analysisRaw = "";
-    var analysis = null;
-    var lastErrMsg = "";
+    console.log("[reprocess] 流式调用 AI:", chatUrl);
+    var streamResult = await streamAiResponse(chatUrl, openaiBody, openaiHeaders);
 
-    for (var u = 0; u < FALLBACK_URLS.length && !analysisRaw; u++) {
-      var baseUrl = FALLBACK_URLS[u].replace(/\/+$/, "");
-      var chatUrl = baseUrl.indexOf("/chat/completions") === -1
-        ? baseUrl + "/chat/completions" : baseUrl;
-
-      try {
-        console.log("[reprocess] AI 尝试 URL" + (u + 1) + ": " + chatUrl);
-        var resp = await axios.post(chatUrl, openaiBody, {
-          headers: openaiHeaders, timeout: 30000,
-        });
-        if (resp && resp.status < 500) {
-          var rd = resp.data;
-          if (rd && rd.choices && rd.choices[0] && rd.choices[0].message && rd.choices[0].message.content) {
-            analysisRaw = rd.choices[0].message.content;
-            break;
-          }
-          if (rd && rd.content && rd.content[0] && rd.content[0].text) {
-            analysisRaw = rd.content[0].text;
-            break;
-          }
-          if (rd && rd.error && rd.error.message) {
-            lastErrMsg = "[URL" + (u + 1) + "] API 返回错误: " + rd.error.message;
-          } else {
-            lastErrMsg = "[URL" + (u + 1) + "] 响应格式无法识别";
-          }
-        }
-      } catch (err) {
-        var statusCode = err.response?.status || 0;
-        var msg = err.response?.data?.error?.message || err.response?.data?.message || err.message || "未知错误";
-        lastErrMsg = "[URL" + (u + 1) + "] " + msg;
-        if (statusCode === 401 || statusCode === 403) break;
-      }
+    if (!streamResult || !streamResult.content) {
+      var errMsg = streamResult?.error || "AI 分析未返回有效内容";
+      console.error("[reprocess] AI 分析失败:", errMsg);
+      return Response.json({ success: false, error: errMsg });
     }
 
-    if (analysisRaw) {
-      analysis = tryParseJson(analysisRaw);
-      if (!analysis) {
-        console.warn("[reprocess] AI 返回非 JSON:", analysisRaw.substring(0, 200));
-      }
+    var analysisRaw = streamResult.content;
+    var analysis = tryParseJson(analysisRaw);
+    if (!analysis) {
+      console.warn("[reprocess] AI 返回非 JSON:", analysisRaw.substring(0, 200));
+      return Response.json({ success: false, error: "AI 返回内容解析失败（非 JSON 格式）" });
     }
 
-    var searchFields;
-    if (!analysis && lastErrMsg) {
-      searchFields = { title: "AI 分析失败", summary: "错误: " + lastErrMsg.substring(0, 300), tags: [] };
-    } else {
-      searchFields = extractSearchFields(analysis);
-    }
+    var searchFields = extractSearchFields(analysis);
     var timestamp = Date.now();
 
     // 6. 覆盖 MD 文件

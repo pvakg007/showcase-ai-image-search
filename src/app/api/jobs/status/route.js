@@ -67,6 +67,10 @@ export async function GET(req) {
         }),
         createdAt: job.createdAt,
         updatedAt: job.updatedAt,
+        // AI 分析实时状态
+        aiStartedAt: job.aiStartedAt || 0,
+        aiPhase: job.aiPhase || "",
+        aiElapsedMs: job.aiElapsedMs || 0,
       },
     });
   } catch (err) {

@@ -56,6 +56,15 @@ export default function AdminPage() {
   var [searchText, setSearchText] = useState("");
   var [loading, setLoading] = useState(false);
 
+  // ========== 翻页 ==========
+  var [adminPage, setAdminPage] = useState(1);
+  var [adminTotalPages, setAdminTotalPages] = useState(1);
+  var adminPerPage = 50;
+
+  // ========== 批量选择 ==========
+  var [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  var [batchLoading, setBatchLoading] = useState(false);
+
   // ========== 编辑弹窗 ==========
   var [editingItem, setEditingItem] = useState<ImageItem | null>(null);
   var [editTitle, setEditTitle] = useState("");
@@ -73,13 +82,21 @@ export default function AdminPage() {
     if (token) setAuthenticated(true);
   }, []);
 
-  // 认证后加载数据
+  // 搜索文本变化时重置到第 1 页
   useEffect(() => {
     if (authenticated) {
-      loadData();
+      setAdminPage(1);
+      loadData(1);
       loadStats();
     }
   }, [authenticated, searchText]);
+
+  // 翻页变化时加载
+  useEffect(() => {
+    if (authenticated && adminPage > 1) {
+      loadData(adminPage);
+    }
+  }, [adminPage]);
 
   // ========== AI 设置 ==========
   var [aiUrl, setAiUrl] = useState("");
@@ -181,14 +198,18 @@ export default function AdminPage() {
   }, []);
 
   // ========== 加载数据 ==========
-  var loadData = useCallback(async () => {
+  var loadData = useCallback(async (pageNum?: number) => {
     setLoading(true);
+    var p = pageNum || adminPage;
     var params = new URLSearchParams();
     if (searchText) params.set("q", searchText);
-    params.set("limit", "100");
+    params.set("limit", String(adminPerPage));
+    params.set("page", String(p));
     var result = await adminFetch("/api/admin/images?" + params.toString());
     if (result.success) {
       setImages(result.data || []);
+      var total = result.total || 0;
+      setAdminTotalPages(Math.max(1, Math.ceil(total / adminPerPage)));
     }
     setLoading(false);
   }, [searchText]);
@@ -350,6 +371,7 @@ export default function AdminPage() {
 
   // ========== 格式化时间 ==========
   var formatTime = function (ts: number) {
+    if (!ts) return "";
     return new Date(ts).toLocaleString("zh-CN", {
       year: "numeric",
       month: "2-digit",
@@ -502,7 +524,7 @@ export default function AdminPage() {
               className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
             <button
-              onClick={loadData}
+              onClick={function () { loadData(adminPage); }}
               className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
             >
               搜索
@@ -649,6 +671,66 @@ export default function AdminPage() {
           </div>
         </details>
 
+        {/* 批量操作栏 */}
+        {!loading && images.length > 0 && (
+          <div className="bg-white rounded-lg shadow-sm p-3 mb-3 flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <label className="flex items-center gap-2 text-sm cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={images.length > 0 && selectedIds.size === images.length}
+                  onChange={function (e) {
+                    if (e.target.checked) {
+                      setSelectedIds(new Set(images.map(function (img) { return img.id; })));
+                    } else {
+                      setSelectedIds(new Set());
+                    }
+                  }}
+                  className="w-4 h-4 rounded border-gray-300"
+                />
+                全选
+              </label>
+              <span className="text-sm text-gray-500">
+                {selectedIds.size > 0 ? "已选 " + selectedIds.size + " 项" : ""}
+              </span>
+            </div>
+            <div className="flex gap-2">
+              {selectedIds.size > 0 && (
+                <button
+                  onClick={async function () {
+                    if (!confirm("确定要删除选中的 " + selectedIds.size + " 张图片吗？此操作不可撤销。")) return;
+                    setBatchLoading(true);
+                    var itemsToDelete = images.filter(function (img) { return selectedIds.has(img.id); });
+                    var items = itemsToDelete.map(function (img) { return { id: img.id, url: img.url, mdUrl: img.mdUrl }; });
+                    var result = await adminFetch("/api/admin/images", {
+                      method: "DELETE",
+                      body: JSON.stringify({ items: items }),
+                    });
+                    if (result.success) {
+                      setSelectedIds(new Set());
+                      loadData(adminPage);
+                      alert("批量删除完成！");
+                    } else {
+                      alert("批量删除失败: " + (result.error || "未知错误"));
+                    }
+                    setBatchLoading(false);
+                  }}
+                  disabled={batchLoading}
+                  className="px-3 py-1 text-xs bg-red-500 text-white rounded hover:bg-red-600 disabled:bg-gray-300 transition-colors"
+                >
+                  {batchLoading ? "删除中..." : "删除选中"}
+                </button>
+              )}
+              <button
+                onClick={function () { loadData(adminPage); }}
+                className="px-3 py-1 text-xs bg-gray-100 text-gray-600 rounded hover:bg-gray-200 transition-colors"
+              >
+                刷新
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* 列表 */}
         {loading ? (
           <div className="text-center py-20 text-gray-500">加载中...</div>
@@ -665,11 +747,27 @@ export default function AdminPage() {
               } else if (item.spaceName) {
                 spaceLabel = item.spaceName;
               }
+              var isSelected = selectedIds.has(item.id);
               return (
                 <div
                   key={item.id}
-                  className="bg-white rounded-lg shadow-sm p-4 flex gap-4"
+                  className={"bg-white rounded-lg shadow-sm p-4 flex gap-4 transition-colors " + (isSelected ? "ring-2 ring-blue-400" : "")}
                 >
+                  {/* 复选框 */}
+                  <div className="flex items-start pt-1 flex-shrink-0">
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      onChange={function (e) {
+                        var next = new Set(selectedIds);
+                        if (e.target.checked) next.add(item.id);
+                        else next.delete(item.id);
+                        setSelectedIds(next);
+                      }}
+                      className="w-4 h-4 mt-1 rounded border-gray-300 cursor-pointer"
+                    />
+                  </div>
+
                   {/* 缩略图 */}
                   <div
                     className="w-20 h-20 flex-shrink-0 cursor-pointer"
@@ -757,6 +855,49 @@ export default function AdminPage() {
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {/* 翻页 */}
+        {!loading && images.length > 0 && adminTotalPages > 1 && (
+          <div className="flex items-center justify-center gap-2 mt-6 mb-4">
+            <button
+              onClick={function () { setAdminPage(adminPage - 1); window.scrollTo(0, 0); }}
+              disabled={adminPage <= 1}
+              className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-100 transition-colors"
+            >
+              ← 上一页
+            </button>
+            {Array.from({ length: Math.min(adminTotalPages, 9) }, function (_, i) {
+              var start = Math.max(1, adminPage - 4);
+              var end = Math.min(adminTotalPages, start + 8);
+              if (end - start < 8) start = Math.max(1, end - 8);
+              var p = start + i;
+              if (p > adminTotalPages) return null;
+              return (
+                <button
+                  key={p}
+                  onClick={function () { setAdminPage(p); window.scrollTo(0, 0); }}
+                  className={"w-8 h-8 text-sm rounded-lg transition-colors " + (
+                    p === adminPage
+                      ? "bg-blue-500 text-white"
+                      : "border border-gray-300 hover:bg-gray-100"
+                  )}
+                >
+                  {p}
+                </button>
+              );
+            })}
+            <button
+              onClick={function () { setAdminPage(adminPage + 1); window.scrollTo(0, 0); }}
+              disabled={adminPage >= adminTotalPages}
+              className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-100 transition-colors"
+            >
+              下一页 →
+            </button>
+            <span className="text-sm text-gray-500 ml-2">
+              {adminPage}/{adminTotalPages}
+            </span>
           </div>
         )}
       </div>

@@ -1,5 +1,5 @@
 "use client";
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import PreviewModal from "../components/PreviewModal";
 
@@ -51,6 +51,7 @@ function saveRecentProject(name: string) {
 export default function UploadPage() {
   const [fileItems, setFileItems] = useState<FileItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [results, setResults] = useState<JobResultItem[]>([]);
   const [router] = useState(useRouter);
 
@@ -62,6 +63,13 @@ export default function UploadPage() {
   const [lastJobId, setLastJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<string>("");
   const [jobProgress, setJobProgress] = useState({ total: 0, done: 0, failed: 0 });
+
+  // ========== AI 实时状态 ==========
+  const [aiStartedAt, setAiStartedAt] = useState(0);        // AI 开始时间戳
+  const [aiPhase, setAiPhase] = useState("");               // waiting_first_chunk / done
+  const [aiElapsedMs, setAiElapsedMs] = useState(0);        // AI 最终耗时（后端返回）
+  const [currentElapsed, setCurrentElapsed] = useState(0);  // 前端实时计算的已等待秒数
+  const aiElapsedTimer = useRef<NodeJS.Timeout | null>(null);
 
   // ========== 预览弹窗 ==========
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -75,44 +83,78 @@ export default function UploadPage() {
     setRecentProjects(loadRecentProjects());
   }, []);
 
+  // ========== AI 实时计时器 ==========
+  // 当 aiStartedAt > 0 且 aiPhase !== "done" 时，每秒更新一次已等待秒数
+  useEffect(function () {
+    if (aiStartedAt > 0 && aiPhase !== "done") {
+      aiElapsedTimer.current = setInterval(function () {
+        var elapsed = Math.floor((Date.now() - aiStartedAt) / 1000);
+        setCurrentElapsed(elapsed);
+      }, 1000);
+      return function () {
+        if (aiElapsedTimer.current) clearInterval(aiElapsedTimer.current);
+      };
+    } else {
+      if (aiElapsedTimer.current) clearInterval(aiElapsedTimer.current);
+    }
+  }, [aiStartedAt, aiPhase]);
+
   // 自动触发处理 + 轮询任务状态
   useEffect(function () {
     if (!lastJobId) return;
     var triggerCount = 0;
+    var statusTimer: NodeJS.Timeout | null = null;
 
     // 1. 先主动触发处理
     async function triggerProcessing() {
       try {
         var res = await fetch("/api/process-queue");
         var data = await res.json();
-        if (data.success) setJobStatus("processing");
+        if (data.success) {
+          setJobStatus("processing");
+          // 同时开始 AI 计时
+          setAiStartedAt(Date.now());
+        }
       } catch (_) {}
     }
     triggerProcessing();
 
-    // 2. 轮询状态，每隔 3 秒检查一次
-    var timer = setInterval(async function () {
+    // 2. 轮询状态，每隔 2 秒检查一次
+    statusTimer = setInterval(async function () {
       try {
         var res = await fetch("/api/jobs/status?jobId=" + lastJobId);
         var data = await res.json();
         if (data.success) {
+          var d = data.data;
           setJobProgress({
-            total: data.data.totalImages || 0,
-            done: data.data.processed || 0,
-            failed: data.data.failed || 0,
+            total: d.totalImages || 0,
+            done: d.processed || 0,
+            failed: d.failed || 0,
           });
-          if (data.data.status === "completed") {
+
+          // 更新 AI 实时状态
+          if (d.aiStartedAt) {
+            setAiStartedAt(d.aiStartedAt);
+          }
+          if (d.aiPhase) {
+            setAiPhase(d.aiPhase);
+          }
+          if (d.aiElapsedMs) {
+            setAiElapsedMs(d.aiElapsedMs);
+          }
+
+          if (d.status === "completed") {
             setJobStatus("completed");
-            setResults(data.data.results || []);
-            clearInterval(timer);
+            setResults(d.results || []);
+            if (statusTimer) clearInterval(statusTimer);
             return;
-          } else if (data.data.status === "failed") {
+          } else if (d.status === "failed") {
             setJobStatus("failed");
-            clearInterval(timer);
+            if (statusTimer) clearInterval(statusTimer);
             return;
-          } else if (data.data.status === "processing") {
+          } else if (d.status === "processing") {
             setJobStatus("processing");
-            return; // 状态已确认，不再需要额外触发
+            return;
           }
         }
 
@@ -122,8 +164,10 @@ export default function UploadPage() {
           fetch("/api/process-queue").catch(function () {});
         }
       } catch (_) {}
-    }, 3000);
-    return function () { clearInterval(timer); };
+    }, 2000);
+    return function () {
+      if (statusTimer) clearInterval(statusTimer);
+    };
   }, [lastJobId]);
 
   // ========== 客户端图片压缩 ==========
@@ -160,7 +204,6 @@ export default function UploadPage() {
     var loadedCount = 0;
 
     selectedFiles.forEach(async function (file, index) {
-      // 非 JPEG 且 > 200KB 的图片先压缩
       var fileToUse = file;
       if (file.type !== "image/jpeg" || file.size > 200 * 1024) {
         try {
@@ -181,6 +224,10 @@ export default function UploadPage() {
           setResults([]);
           setLastJobId(null);
           setJobStatus("");
+          setUploadProgress(0);
+          setAiPhase("");
+          setAiStartedAt(0);
+          setCurrentElapsed(0);
           e.target.value = "";
         }
       };
@@ -217,14 +264,18 @@ export default function UploadPage() {
     });
   }, []);
 
-  // ========== 上传（异步：先传文件到 COS，后台处理） ==========
-  const handleUpload = useCallback(async function (mode: "batch" | "individual") {
+  // ========== 上传（使用 XHR 实现进度反馈） ==========
+  const handleUpload = useCallback(function (mode: "batch" | "individual") {
     if (fileItems.length === 0) return;
 
     setLoading(true);
     setResults([]);
     setLastJobId(null);
     setJobStatus("uploading");
+    setUploadProgress(0);
+    setAiPhase("");
+    setAiStartedAt(0);
+    setCurrentElapsed(0);
 
     // 保存项目名
     if (projectName) {
@@ -232,35 +283,56 @@ export default function UploadPage() {
       setRecentProjects(loadRecentProjects());
     }
 
-    try {
-      // 直接上传原始文件（不压缩）
-      var formData = new FormData();
-      for (var i = 0; i < fileItems.length; i++) {
-        formData.append("files", fileItems[i].file);
-        formData.append("spaceNames", JSON.stringify(fileItems[i].spaceNames));
+    // 使用 XHR 以获得上传进度事件
+    var formData = new FormData();
+    for (var i = 0; i < fileItems.length; i++) {
+      formData.append("files", fileItems[i].file);
+      formData.append("spaceNames", JSON.stringify(fileItems[i].spaceNames));
+    }
+    formData.append("mode", mode);
+    formData.append("projectName", projectName);
+
+    var xhr = new XMLHttpRequest();
+
+    xhr.upload.onprogress = function (e) {
+      if (e.lengthComputable) {
+        var pct = Math.round(e.loaded / e.total * 100);
+        setUploadProgress(pct);
       }
-      formData.append("mode", mode);
-      formData.append("projectName", projectName);
+    };
 
-      var res = await fetch("/api/upload", { method: "POST", body: formData });
-      var data = await res.json();
-
-      if (data.success) {
-        setLastJobId(data.jobId);
-        setJobStatus("pending");
-        setJobProgress({ total: data.fileCount || 0, done: 0, failed: 0 });
-        setFileItems([]);
+    xhr.onload = function () {
+      setLoading(false);
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          var data = JSON.parse(xhr.responseText);
+          if (data.success) {
+            setLastJobId(data.jobId);
+            setJobStatus("pending");
+            setJobProgress({ total: data.fileCount || 0, done: 0, failed: 0 });
+            setFileItems([]);
+          } else {
+            alert("上传失败: " + (data.error || "未知错误"));
+            setJobStatus("");
+          }
+        } catch (_) {
+          alert("上传失败: 响应解析错误");
+          setJobStatus("");
+        }
       } else {
-        alert("上传失败: " + (data.error || "未知错误"));
+        alert("上传失败: HTTP " + xhr.status);
         setJobStatus("");
       }
-    } catch (err) {
-      alert("上传失败，请重试");
-      console.error(err);
-      setJobStatus("");
-    } finally {
+    };
+
+    xhr.onerror = function () {
       setLoading(false);
-    }
+      alert("上传失败，请检查网络");
+      setJobStatus("");
+    };
+
+    xhr.open("POST", "/api/upload");
+    xhr.send(formData);
   }, [fileItems, projectName]);
 
   // ========== 预览弹窗 ==========
@@ -281,6 +353,35 @@ export default function UploadPage() {
 
   // 判断上传按钮是否可点
   var canUpload = fileItems.length > 0 && !loading;
+
+  // ========== 构建 AI 状态文本 ==========
+  function getAiStatusText(): { icon: string; text: string; detail: string } {
+    if (aiPhase === "done") {
+      return {
+        icon: "✅",
+        text: "AI 分析完成",
+        detail: aiElapsedMs > 0 ? "耗时 " + Math.round(aiElapsedMs / 1000) + "s" : "",
+      };
+    }
+    if (aiPhase === "failed") {
+      return {
+        icon: "❌",
+        text: "AI 分析失败",
+        detail: "已终止处理",
+      };
+    }
+    if (aiPhase === "waiting_first_chunk") {
+      var secs = currentElapsed > 0 ? currentElapsed : Math.floor((Date.now() - aiStartedAt) / 1000);
+      // 首帧期望 2-10s，超过 15s 展示警告
+      var isLong = secs > 15;
+      return {
+        icon: isLong ? "⚠️" : "🔄",
+        text: isLong ? "AI 首帧等待中（超时风险）" : "AI 分析中（等待首帧...）",
+        detail: "已等待 " + secs + "s" + (isLong ? "（超过 15s 可能失败）" : "（预计 2-10s）"),
+      };
+    }
+    return { icon: "", text: "", detail: "" };
+  }
 
   return (
     <main className="min-h-screen bg-gray-50 p-4">
@@ -371,32 +472,84 @@ export default function UploadPage() {
             「分张」每张图分别分析、「批量」所有图一次分析（视 API 能力）
           </p>
 
-          {/* ===== 任务状态 ===== */}
+          {/* ===== 任务状态（增强版） ===== */}
           {jobStatus && jobStatus !== "" && (
             <div className={"mt-4 p-4 rounded-lg border " + (
               jobStatus === "completed" ? "bg-green-50 border-green-200" :
               jobStatus === "failed" ? "bg-red-50 border-red-200" :
               "bg-blue-50 border-blue-200"
             )}>
+              {/* 主状态 */}
               <p className="font-medium">
                 {jobStatus === "uploading" && "⏳ 上传文件中..."}
-                {jobStatus === "pending" && "✅ 文件已上传，等待处理..."}
-                {jobStatus === "processing" && "🔄 分析中..."}
+                {jobStatus === "pending" && "✅ 文件已上传，等待队列处理..."}
+                {jobStatus === "processing" && (
+                  <span>
+                    {jobProgress.done > 0
+                      ? "📊 处理中（" + jobProgress.done + "/" + jobProgress.total + "）"
+                      : "🔄 分析中..."}
+                  </span>
+                )}
                 {jobStatus === "completed" && "✅ 处理完成！"}
                 {jobStatus === "failed" && "❌ 处理失败"}
               </p>
-              {(jobStatus === "pending" || jobStatus === "processing") && jobProgress.total > 0 && (
-                <p className="text-sm text-gray-600 mt-1">
-                  进度：{jobProgress.done}/{jobProgress.total}
-                  {jobProgress.failed > 0 && " （" + jobProgress.failed + " 失败）"}
-                </p>
+
+              {/* 上传进度条 */}
+              {jobStatus === "uploading" && (
+                <div className="mt-2">
+                  <div className="w-full bg-gray-200 rounded-full h-2.5">
+                    <div
+                      className="bg-blue-500 h-2.5 rounded-full transition-all duration-300"
+                      style={{ width: uploadProgress + "%" }}
+                    />
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1">{uploadProgress}% 已完成</p>
+                </div>
               )}
+
+              {/* 处理进度 */}
+              {(jobStatus === "pending" || jobStatus === "processing") && jobProgress.total > 0 && (
+                <div className="mt-2 space-y-1">
+                  {/* 整体进度条 */}
+                  <div className="w-full bg-gray-200 rounded-full h-2">
+                    <div
+                      className={"h-2 rounded-full transition-all duration-500 " + (
+                        jobProgress.failed > 0 ? "bg-orange-400" : "bg-green-500"
+                      )}
+                      style={{ width: Math.round((jobProgress.done / jobProgress.total) * 100) + "%" }}
+                    />
+                  </div>
+                  <p className="text-sm text-gray-600">
+                    进度：{jobProgress.done}/{jobProgress.total}
+                    {jobProgress.failed > 0 && "（" + jobProgress.failed + " 失败）"}
+                  </p>
+                </div>
+              )}
+
+              {/* AI 实时状态 */}
+              {jobStatus === "processing" && aiPhase && (
+                <div className={"mt-2 p-2 rounded text-sm " + (
+                  aiPhase === "done"
+                    ? "bg-green-100 text-green-800"
+                    : aiPhase === "waiting_first_chunk"
+                    ? "bg-yellow-100 text-yellow-800"
+                    : "bg-gray-100 text-gray-600"
+                )}>
+                  <p>
+                    {getAiStatusText().icon} {getAiStatusText().text}
+                  </p>
+                  {getAiStatusText().detail && (
+                    <p className="text-xs mt-0.5 opacity-75">{getAiStatusText().detail}</p>
+                  )}
+                </div>
+              )}
+
               {jobStatus === "pending" && (
                 <p className="text-xs text-gray-400 mt-1">
                   任务编号：{lastJobId}（可关闭页面，之后在管理后台查看结果）
                 </p>
               )}
-              {lastJobId && (
+              {lastJobId && jobStatus !== "completed" && jobStatus !== "failed" && (
                 <button
                   onClick={async function () {
                     var res = await fetch("/api/process-queue");

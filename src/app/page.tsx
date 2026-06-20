@@ -35,6 +35,11 @@ export default function Home() {
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
 
+  // 翻页
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const perPage = 20;
+
   // 预览弹窗状态
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewType, setPreviewType] = useState<"image" | "markdown">(
@@ -53,16 +58,24 @@ export default function Home() {
 
   const debouncedSearchText = useDebounce(searchText, 300);
 
-  // 页面加载和搜索条件变化时自动搜索
+  // 搜索条件变化时重置到第一页并搜索
   useEffect(() => {
-    fetchData();
+    setPage(1);
+    fetchData(1);
   }, [debouncedSearchText, selectedTags]);
 
-  const fetchData = async () => {
+  // 翻页时不重置条件
+  useEffect(() => {
+    if (page > 1) fetchData(page);
+  }, [page]);
+
+  const fetchData = async (pageNum?: number) => {
     setLoading(true);
     try {
-      const query: { q: string; filter?: string } = {
+      var currentPage = pageNum || page;
+      var query: { q: string; filter?: string; page?: number } = {
         q: debouncedSearchText,
+        page: currentPage,
       };
 
       if (selectedTags.length > 0) {
@@ -79,6 +92,8 @@ export default function Home() {
 
       const data = await res.json();
       setImages(data.hits || []);
+      var total = data.estimatedTotalHits || 0;
+      setTotalPages(Math.max(1, Math.ceil(total / perPage)));
     } catch (err) {
       console.error("搜索错误:", err);
     } finally {
@@ -224,7 +239,7 @@ export default function Home() {
                   <div
                     className="aspect-square overflow-hidden cursor-pointer"
                     onClick={() =>
-                      openPreview(img.url, "image", img.title)
+                      openPreview(img.url, "image", img.title, img.tags, (img as any).batchId)
                     }
                   >
                     <img
@@ -285,7 +300,7 @@ export default function Home() {
                       </button>
                       <button
                         onClick={() =>
-                          openPreview(img.url, "image", img.title, img.tags, (img as any).batchId)
+                          window.open(img.url, "_blank")
                         }
                         className="flex-1 px-3 py-1 bg-blue-100 text-blue-700 hover:bg-blue-200 rounded text-center text-sm transition-colors"
                       >
@@ -296,6 +311,49 @@ export default function Home() {
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {/* 翻页 */}
+        {!loading && images.length > 0 && totalPages > 1 && (
+          <div className="flex items-center justify-center gap-2 mt-6 mb-4">
+            <button
+              onClick={() => { setPage(page - 1); window.scrollTo(0, 0); }}
+              disabled={page <= 1}
+              className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-100 transition-colors"
+            >
+              ← 上一页
+            </button>
+            {Array.from({ length: Math.min(totalPages, 9) }, function (_, i) {
+              var start = Math.max(1, page - 4);
+              var end = Math.min(totalPages, start + 8);
+              if (end - start < 8) start = Math.max(1, end - 8);
+              var p = start + i;
+              if (p > totalPages) return null;
+              return (
+                <button
+                  key={p}
+                  onClick={() => { setPage(p); window.scrollTo(0, 0); }}
+                  className={"w-8 h-8 text-sm rounded-lg transition-colors " + (
+                    p === page
+                      ? "bg-blue-500 text-white"
+                      : "border border-gray-300 hover:bg-gray-100"
+                  )}
+                >
+                  {p}
+                </button>
+              );
+            })}
+            <button
+              onClick={() => { setPage(page + 1); window.scrollTo(0, 0); }}
+              disabled={page >= totalPages}
+              className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-100 transition-colors"
+            >
+              下一页 →
+            </button>
+            <span className="text-sm text-gray-500 ml-2">
+              {page}/{totalPages}
+            </span>
           </div>
         )}
       </div>
