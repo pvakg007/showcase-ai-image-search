@@ -132,18 +132,9 @@ export async function POST(req) {
       ).catch(function () {});
     } catch (_) {}
 
-    // 保存项目名称到 localStorage（通过响应返回，客户端自行保存）
-    // 4. 触发后台处理（fire-and-forget，Vercel 会在响应后短暂保持运行）
-    try {
-      var baseUrl = process.env.VERCEL_URL
-        ? "https://" + process.env.VERCEL_URL
-        : (process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000");
-      // 使用 undici/fetch 的 keepalive 来触发后台处理
-      fetch(baseUrl + "/api/process-queue", {
-        method: "GET",
-        headers: { "x-api-key": "internal" },
-      }).catch(function () {});
-    } catch (_) {}
+    // 触发由客户端打开 SSE 流完成（/api/process-stream?jobId=xxx）。
+    // 不再 fire-and-forget process-queue，避免与 SSE 并发抢同一任务。
+    // 关闭页面后，下次有页面加载会 fire-and-forget process-queue 从断点续跑。
 
     return Response.json({
       success: true,

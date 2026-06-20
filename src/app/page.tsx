@@ -58,6 +58,9 @@ export default function Home() {
 
   const debouncedSearchText = useDebounce(searchText, 300);
 
+  // 页面加载时 fire-and-forget 触发后台工作进程，捡起遗留任务（断点续跑）
+  useEffect(() => { fetch("/api/process-queue").catch(() => {}); }, []);
+
   // 搜索条件变化时重置到第一页并搜索
   useEffect(() => {
     setPage(1);
