@@ -212,11 +212,12 @@ export default function UploadPage() {
 
     es.addEventListener("compressed", function (e: MessageEvent) {
       var d = JSON.parse(e.data);
-      setCompressList(function (prev) { return prev.concat([{ index: d.index, originalSize: d.originalSize, compressedSize: d.compressedSize, sharp: d.sharp }]); });
+      setCompressList(function (prev) { return prev.concat([{ index: d.index, originalSize: d.originalSize, compressedSize: d.compressedSize, sharp: !!d.sharp }]); });
+      // 压缩在浏览器上传前完成，服务端只报告最终尺寸
       if (d.sharp) {
-        addLog("ok", "✓ 图片 " + d.index + " 压缩 " + formatBytes(d.originalSize) + " → " + formatBytes(d.compressedSize));
+        addLog("ok", "✓ 图片 " + d.index + " " + formatBytes(d.originalSize) + " → " + formatBytes(d.compressedSize));
       } else {
-        addLog("warn", "⚠ 图片 " + d.index + " 压缩不可用，使用原图 " + formatBytes(d.originalSize) + "（sharp 未加载）");
+        addLog("ok", "✓ 图片 " + d.index + " 就绪 " + formatBytes(d.compressedSize));
       }
     });
 

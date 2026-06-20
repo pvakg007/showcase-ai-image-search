@@ -41,21 +41,20 @@ export async function GET(req) {
     return sseOnce([{ type: "fatal", data: { stage: "setup", message: "缺少 jobId" } }]);
   }
 
-  // 查找任务
+  // 查找任务：直接按主键取文档（避免 filter id 需要 id 为 filterable 的依赖）
   var job = null;
   try {
-    var res = await axios.post(
-      MEILI() + "/indexes/processing_jobs/search",
-      { q: "", filter: 'id = "' + jobId + '"', limit: 1 },
+    var res = await axios.get(
+      MEILI() + "/indexes/processing_jobs/documents/" + encodeURIComponent(jobId),
       { headers: H() }
     );
-    job = (res.data.hits || [])[0];
+    job = res.data;
   } catch (err) {
     console.error("[stream] 查询任务失败:", err.message);
     return sseOnce([{ type: "fatal", data: { stage: "setup", message: "查询任务失败: " + err.message } }]);
   }
 
-  if (!job) {
+  if (!job || !job.id) {
     return sseOnce([{ type: "fatal", data: { stage: "setup", message: "任务不存在: " + jobId } }]);
   }
 

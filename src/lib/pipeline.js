@@ -16,13 +16,8 @@ import axios from "axios";
 import path from "path";
 import fs from "fs";
 
-// ---- sharp（原生二进制模块，需在 next.config.mjs 外部化）----
-var sharp = null;
-try {
-  sharp = require("sharp");
-} catch (err) {
-  console.warn("sharp 加载失败，服务端压缩不可用:", err && err.message);
-}
+// 压缩由浏览器在上传前完成（1600px JPEG）。服务端不再依赖 sharp —— 它在 Vercel
+// serverless 上 libvips.so 会被排除出函数包，反复加载失败。服务端只做透传并测量尺寸。
 
 // ============================================================
 // 工具函数
@@ -182,34 +177,12 @@ function buildMarkdown(analysis, imageUrl, timestamp, spaceNames, imageIndex) {
 }
 
 /**
- * 服务端压缩图片：转为 JPEG，最大边不超过 maxPx
+ * 服务端图片处理：透传 buffer（浏览器已在上传前压缩到 1600px JPEG），仅测量尺寸。
  * 返回 { buffer, originalSize, compressedSize, sharpUsed }
  */
-async function compressImage(buffer, maxPx) {
-  var originalSize = buffer.length;
-  if (!sharp) {
-    return { buffer: buffer, originalSize: originalSize, compressedSize: originalSize, sharpUsed: false };
-  }
-  try {
-    var metadata = await sharp(buffer).metadata();
-    var maxDim = Math.max(metadata.width || 0, metadata.height || 0);
-    if (maxDim <= maxPx && metadata.format === "jpeg") {
-      return { buffer: buffer, originalSize: originalSize, compressedSize: originalSize, sharpUsed: true };
-    }
-    var opts = {};
-    if (maxDim > maxPx) {
-      var scale = maxPx / maxDim;
-      opts.width = Math.round((metadata.width || 0) * scale);
-      opts.height = Math.round((metadata.height || 0) * scale);
-      opts.fit = "inside";
-      opts.withoutEnlargement = true;
-    }
-    var out = await sharp(buffer).resize(opts).jpeg({ quality: 85 }).toBuffer();
-    return { buffer: out, originalSize: originalSize, compressedSize: out.length, sharpUsed: true };
-  } catch (err) {
-    console.warn("服务端压缩失败:", err.message);
-    return { buffer: buffer, originalSize: originalSize, compressedSize: originalSize, sharpUsed: false };
-  }
+async function compressImage(buffer) {
+  var size = buffer.length;
+  return { buffer: buffer, originalSize: size, compressedSize: size, sharpUsed: false };
 }
 
 // ============================================================
