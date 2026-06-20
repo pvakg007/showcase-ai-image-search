@@ -5,13 +5,17 @@ import axios from "axios";
 import path from "path";
 import fs from "fs";
 
-// 动态导入 sharp（ESM 包在 CJS 中的兼容方式）
+// 动态导入 sharp（原生二进制模块，需在 next.config.mjs 中外部化）
 var sharp = null;
 try {
   sharp = require("sharp");
-} catch (_) {
-  console.warn("sharp 未安装，服务端压缩不可用");
+} catch (err) {
+  // 打印真实错误，避免吞掉（之前只打印"未安装"，掩盖了 Vercel 上二进制加载失败的真因）
+  console.warn("sharp 加载失败，服务端压缩不可用:", err && err.message);
 }
+
+// 单次函数最长运行时间（秒）。Vercel Pro 上限 300，留 10s 余量给收尾。
+export const maxDuration = 290;
 
 const cos = new COS({
   SecretId: process.env.COS_SECRET_ID,
@@ -255,7 +259,7 @@ async function streamAiResponse(url, body, headers) {
   var accumulatedContent = "";
   var firstChunkReceived = false;
   var FIRST_CHUNK_TIMEOUT = 15000;
-  var FULL_TIMEOUT = 120000;
+  var FULL_TIMEOUT = 250000;
   var lastErrMsg = "";
   var startTime = Date.now();
 
@@ -341,7 +345,7 @@ async function streamAiResponse(url, body, headers) {
   } catch (err) {
     clearTimeout(fullTimeoutId);
     if (err.name === "AbortError") {
-      return { content: null, isAuthError: false, error: lastErrMsg || "请求超时（120s）" };
+      return { content: null, isAuthError: false, error: lastErrMsg || "请求超时（250s）" };
     }
     return { content: null, isAuthError: false, error: err.message };
   }
