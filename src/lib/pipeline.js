@@ -95,7 +95,7 @@ export function extractSearchFields(analysis, imageIndex, spaceNames) {
         if (Array.isArray(s && s.materials)) s.materials.forEach(function (m) { if (m) tagSet.add(m); });
       });
     }
-    tags = Array.from(tagSet).slice(0, 15);
+    tags = Array.from(tagSet).slice(0, 30);
   } catch (_) {}
   return { title: title, summary: summary, tags: tags };
 }

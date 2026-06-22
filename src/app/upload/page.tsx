@@ -12,7 +12,7 @@ const PRESET_SPACES = [
 interface FileItem {
   file: File;
   preview: string;
-  spaceNames: string[];
+  spaceText: string; // 原始文本（允许输入 ，, 、 作为分隔符），提交时再解析
 }
 
 interface JobResultItem {
@@ -60,6 +60,11 @@ function formatBytes(n: number): string {
   return (n / 1024 / 1024).toFixed(2) + "MB";
 }
 
+/** 把输入文本按 ，, 、 分隔成空间名数组 */
+function parseSpaces(text: string): string[] {
+  return String(text || "").split(/[，,、]/).map(function (s) { return s.trim(); }).filter(Boolean);
+}
+
 export default function UploadPage() {
   const [fileItems, setFileItems] = useState<FileItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -87,6 +92,9 @@ export default function UploadPage() {
   const esRef = useRef<EventSource | null>(null);
   const aiContentRef = useRef("");
   const stageRef = useRef<typeof stage>("idle");
+  const aiTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const aiSubmitAtRef = useRef(0);
+  const aiFirstFrameAtRef = useRef(0);
 
   // 保持 stageRef 与 stage 同步，供 onerror 闭包读取最新值
   useEffect(function () { stageRef.current = stage; }, [stage]);
@@ -105,9 +113,12 @@ export default function UploadPage() {
     fetch("/api/process-queue").catch(function () {});
   }, []);
 
-  // 关闭时清理 SSE
+  // 关闭时清理 SSE + AI 计时器
   useEffect(function () {
-    return function () { if (esRef.current) esRef.current.close(); };
+    return function () {
+      if (esRef.current) esRef.current.close();
+      if (aiTimerRef.current) clearInterval(aiTimerRef.current);
+    };
   }, []);
 
   const addLog = useCallback(function (type: LogLine["type"], text: string) {
@@ -150,7 +161,7 @@ export default function UploadPage() {
       try { fileToUse = await compressImageClient(file); } catch (_) {}
       var reader = new FileReader();
       reader.onload = function (event) {
-        newItems[index] = { file: fileToUse, preview: (event.target?.result as string) || "", spaceNames: [] };
+        newItems[index] = { file: fileToUse, preview: (event.target?.result as string) || "", spaceText: "" };
         loadedCount++;
         if (loadedCount === selectedFiles.length) {
           setFileItems(function (prev) { return prev.concat(newItems); });
@@ -165,18 +176,19 @@ export default function UploadPage() {
     setFileItems(function (prev) { return prev.filter(function (_, i) { return i !== index; }); });
   }, []);
 
-  const updateSpaceNames = useCallback(function (index: number, names: string[]) {
+  const setSpaceText = useCallback(function (index: number, text: string) {
     setFileItems(function (prev) {
-      return prev.map(function (item, i) { return i === index ? { ...item, spaceNames: names } : item; });
+      return prev.map(function (item, i) { return i === index ? { ...item, spaceText: text } : item; });
     });
   }, []);
 
   const togglePreset = useCallback(function (index: number, preset: string) {
     setFileItems(function (prev) {
       var item = prev[index]; if (!item) return prev;
-      var exists = item.spaceNames.includes(preset);
-      var newNames = exists ? item.spaceNames.filter(function (n) { return n !== preset; }) : item.spaceNames.concat([preset]);
-      return prev.map(function (it, i) { return i === index ? { ...it, spaceNames: newNames } : it; });
+      var names = parseSpaces(item.spaceText);
+      var exists = names.indexOf(preset) !== -1;
+      var newNames = exists ? names.filter(function (n) { return n !== preset; }) : names.concat([preset]);
+      return prev.map(function (it, i) { return i === index ? { ...it, spaceText: newNames.join("、") } : it; });
     });
   }, []);
 
@@ -224,12 +236,26 @@ export default function UploadPage() {
       var d = JSON.parse(e.data);
       setAiSubmitted(true);
       setAiCurrentSec(0);
+      setAiSinceFirstSec(0);
+      setAiFirstFrameMs(0);
       addLog("info", "🤖 提交 AI 分析（" + d.totalImages + " 张，payload " + formatBytes(d.payloadBytes) + "，模型 " + (d.model || "?") + "）");
+      // 启动客户端读秒（首帧到达前也能看到等待秒数在走，不再冻结在 0s）
+      aiSubmitAtRef.current = Date.now();
+      aiFirstFrameAtRef.current = 0;
+      if (aiTimerRef.current) clearInterval(aiTimerRef.current);
+      aiTimerRef.current = setInterval(function () {
+        var now = Date.now();
+        setAiCurrentSec(Math.floor((now - aiSubmitAtRef.current) / 1000));
+        if (aiFirstFrameAtRef.current > 0) {
+          setAiSinceFirstSec(Math.floor((now - aiFirstFrameAtRef.current) / 1000));
+        }
+      }, 1000);
     });
 
     es.addEventListener("first_frame", function (e: MessageEvent) {
       var d = JSON.parse(e.data);
       setAiFirstFrameMs(d.elapsedMs);
+      aiFirstFrameAtRef.current = aiSubmitAtRef.current + d.elapsedMs;
       addLog("ok", "✓ AI 首帧已到达（" + (d.elapsedMs / 1000).toFixed(1) + "s）");
     });
 
@@ -239,11 +265,7 @@ export default function UploadPage() {
       setAiContent(aiContentRef.current);
     });
 
-    es.addEventListener("tail_wait", function (e: MessageEvent) {
-      var d = JSON.parse(e.data);
-      setAiCurrentSec(d.elapsedSec);
-      setAiSinceFirstSec(d.sinceFirstSec);
-    });
+    // tail_wait 由客户端计时器接管，这里不再覆盖（避免与服务端心跳竞争）
 
     es.addEventListener("image_done", function (e: MessageEvent) {
       var d = JSON.parse(e.data);
@@ -254,6 +276,7 @@ export default function UploadPage() {
 
     es.addEventListener("complete", function (e: MessageEvent) {
       var d = JSON.parse(e.data);
+      if (aiTimerRef.current) { clearInterval(aiTimerRef.current); aiTimerRef.current = null; }
       addLog("ok", "🎉 全部完成");
       setResults(d.results || []);
       setStage("completed");
@@ -261,6 +284,7 @@ export default function UploadPage() {
     });
 
     es.addEventListener("fatal", function (e: MessageEvent) {
+      if (aiTimerRef.current) { clearInterval(aiTimerRef.current); aiTimerRef.current = null; }
       try { var d = JSON.parse(e.data); addLog("error", "❌ " + (d.message || "处理失败")); } catch (_) {}
       setStage("failed");
       es.close();
@@ -269,6 +293,7 @@ export default function UploadPage() {
     // EventSource 原生 error（连接断开/服务端 500/被杀）。完成/失败事件已主动 close。
     // 用 ref 追踪当前 stage，避免闭包捕获旧值。
     es.onerror = function () {
+      if (aiTimerRef.current) { clearInterval(aiTimerRef.current); aiTimerRef.current = null; }
       if (stageRef.current === "streaming") {
         addLog("warn", "连接中断，任务转入后台继续，稍后可在此页或管理后台查看结果");
         setStage("failed");
@@ -290,7 +315,7 @@ export default function UploadPage() {
     var formData = new FormData();
     for (var i = 0; i < fileItems.length; i++) {
       formData.append("files", fileItems[i].file);
-      formData.append("spaceNames", JSON.stringify(fileItems[i].spaceNames));
+      formData.append("spaceNames", JSON.stringify(parseSpaces(fileItems[i].spaceText)));
     }
     formData.append("mode", mode);
     formData.append("projectName", projectName);
@@ -458,13 +483,13 @@ export default function UploadPage() {
                     <div className="flex-1 min-w-0">
                       <p className="text-sm text-gray-500 mb-2 truncate">{item.file.name}</p>
                       <label className="block text-sm font-medium mb-1">空间名称</label>
-                      <input type="text" placeholder="点击预设标签选择" value={item.spaceNames.join("、")}
-                        onChange={function (e) { updateSpaceNames(index, e.target.value.split(/[，,、]/).map(function (s) { return s.trim(); }).filter(Boolean)); }}
+                      <input type="text" placeholder="输入空间名，可用 ，, 、 分隔" value={item.spaceText}
+                        onChange={function (e) { setSpaceText(index, e.target.value); }}
                         className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 mb-2" />
                       <div className="flex flex-wrap gap-1.5 mb-2">
                         {PRESET_SPACES.map(function (preset) {
                           return <button key={preset} type="button" onClick={function () { togglePreset(index, preset); }}
-                            className={"px-2.5 py-1 text-xs rounded-full border transition-colors " + (item.spaceNames.includes(preset) ? "bg-blue-500 text-white border-blue-500" : "bg-gray-50 text-gray-600 border-gray-300 hover:bg-blue-50 hover:border-blue-300")}>{preset}</button>;
+                            className={"px-2.5 py-1 text-xs rounded-full border transition-colors " + (parseSpaces(item.spaceText).indexOf(preset) !== -1 ? "bg-blue-500 text-white border-blue-500" : "bg-gray-50 text-gray-600 border-gray-300 hover:bg-blue-50 hover:border-blue-300")}>{preset}</button>;
                         })}
                       </div>
                     </div>
