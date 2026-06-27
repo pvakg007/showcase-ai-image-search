@@ -683,6 +683,18 @@ export default function AdminPage() {
                         <span>🗜 {compressedNote}</span>
                         {job.totalFinalSize > 0 && <span>📦 总 {formatBytes(job.totalFinalSize)}</span>}
                       </div>
+                      {/* 行2b：批次进度（多批时显示） */}
+                      {job.totalBatches > 1 && Array.isArray(job.batches) && (
+                        <div className="text-gray-500 text-xs mt-1 flex items-center gap-1.5 flex-wrap">
+                          <span>📦 批次 {job.doneBatches}/{job.totalBatches}{job.failedBatches > 0 ? "（" + job.failedBatches + " 失败）" : ""}</span>
+                          {job.batches.map(function (b: any, bi: number) {
+                            if (!b) return null;
+                            var dot = b.status === "done" ? "✓" : b.status === "failed" ? "✗" : b.status === "processing" ? "▶" : "·";
+                            var cls = b.status === "done" ? "text-green-600" : b.status === "failed" ? "text-red-600" : b.status === "processing" ? "text-blue-600" : "text-gray-300";
+                            return <span key={bi} className={cls + " font-mono"} title={"批 " + (bi + 1) + " " + b.status}>{dot}</span>;
+                          })}
+                        </div>
+                      )}
                       {/* 行3：文件明细 */}
                       {Array.isArray(job.files) && job.files.length > 0 && (
                         <div className="mt-2 space-y-1">
@@ -703,6 +715,21 @@ export default function AdminPage() {
                       {/* 失败错误信息 */}
                       {job.status === "failed" && job.error && (
                         <div className="mt-1.5 text-xs text-red-500 bg-red-50 rounded px-2 py-1 break-all">错误：{job.error}</div>
+                      )}
+                      {/* 监管日志（progressLog 最近几条） */}
+                      {Array.isArray(job.progressLog) && job.progressLog.length > 0 && (
+                        <details className="mt-1.5">
+                          <summary className="text-xs text-gray-400 cursor-pointer select-none">监管日志（{job.progressLog.length}）</summary>
+                          <div className="mt-1 space-y-0.5 pl-1">
+                            {job.progressLog.map(function (p: any, pi: number) {
+                              return (
+                                <div key={pi} className="text-xs text-gray-400 font-mono leading-relaxed">
+                                  <span className="text-gray-300">[{formatTime(p.ts)}]</span> {p.event}: {p.msg}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </details>
                       )}
                     </div>
                   );

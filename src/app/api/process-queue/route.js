@@ -22,7 +22,7 @@ async function updateJob(jobId, fields) {
   );
 }
 
-/** 恢复卡住的任务（processing 状态 > 2 分钟未心跳 → 视为 SSE 函数已死，重置为 pending） */
+/** 恢复卡住的任务（processing 状态 > 2 分钟未心跳 → 视为函数已死，重置为 pending） */
 async function recoverStuckJobs() {
   try {
     var cutoff = Date.now() - 2 * 60 * 1000;
@@ -34,9 +34,23 @@ async function recoverStuckJobs() {
     });
     for (var j of stuckHits) {
       console.log("[recovery] 恢复卡住的任务:", j.id);
-      // 重置为 pending，保留 aiRaw / files.compressedKey 等断点 → runPipeline 从断点续跑
-      await updateJob(j.id, { status: "pending", processingLock: 0, updatedAt: Date.now() });
+      // 重置为 pending，保留 files.compressedKey / batches 等断点 → runPipeline 从断点续跑
+      // 追加 progressLog 一条，向后台汇报恢复事件
+      var log = Array.isArray(j.progressLog) ? j.progressLog.slice() : [];
+      log.push({ ts: Date.now(), event: "recovered", msg: "卡住" + Math.round((Date.now() - (j.processingLock || cutoff)) / 1000) + "s 后被恢复机制捡起" });
+      if (log.length > 30) log = log.slice(-30);
+      await updateJob(j.id, { status: "pending", processingLock: 0, progressLog: log, updatedAt: Date.now() });
     }
+  } catch (_) {}
+}
+
+/** 触发本服务下一次后台处理（fire-and-forget，用于分批续跑） */
+function triggerNext() {
+  try {
+    var baseUrl = process.env.VERCEL_URL
+      ? "https://" + process.env.VERCEL_URL
+      : (process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000");
+    fetch(baseUrl + "/api/process-queue", { method: "GET", headers: { "x-api-key": "internal" } }).catch(function () {});
   } catch (_) {}
 }
 
@@ -63,12 +77,20 @@ export async function GET() {
     // 锁定
     await updateJob(jobId, { status: "processing", processingLock: Date.now(), aiPhase: "running", updatedAt: Date.now() });
 
-    // 静默跑完整流水线（onEvent 空 → 无推送，靠断点续跑）
+    // 静默跑流水线（onEvent 空 → 无推送，靠 batches 断点续跑）
     var result = await runPipeline(job, { onEvent: function () {}, heartbeat: function () {} });
+
+    if (result.stopped) {
+      // 时间预算中止：仍有 pending 批 → 置 pending 并立即触发下一轮接力续跑（不标记 failed）
+      await updateJob(jobId, { status: "pending", processingLock: 0, results: result.results, batches: result.batches, aiPhase: "paused", updatedAt: Date.now() });
+      triggerNext();
+      return Response.json({ success: true, message: "时间预算中止，已触发后台续跑", jobId: jobId });
+    }
 
     await updateJob(jobId, {
       status: result.success ? "completed" : "failed",
       results: result.results,
+      batches: result.batches,
       error: result.success ? null : result.error,
       processingLock: 0,
       aiPhase: result.success ? "done" : "failed",

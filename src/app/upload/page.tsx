@@ -150,12 +150,14 @@ export default function UploadPage() {
     });
   }
 
-  const handleFileChange = useCallback(function (e: React.ChangeEvent<HTMLInputElement>) {
-    var selectedFiles = Array.from(e.target.files || []);
-    if (selectedFiles.length === 0) return;
+  const addFiles = useCallback(function (selectedFiles: File[]) {
+    if (!selectedFiles || selectedFiles.length === 0) return;
+    // 仅接受图片
+    var imgs = selectedFiles.filter(function (f) { return f.type.startsWith("image/"); });
+    if (imgs.length === 0) return;
     var newItems: FileItem[] = [];
     var loadedCount = 0;
-    selectedFiles.forEach(async function (file, index) {
+    imgs.forEach(async function (file, index) {
       var fileToUse = file;
       // 一律压缩（移动端照片普遍较大，不压缩会导致服务端超时）
       try { fileToUse = await compressImageClient(file); } catch (_) {}
@@ -163,14 +165,28 @@ export default function UploadPage() {
       reader.onload = function (event) {
         newItems[index] = { file: fileToUse, preview: (event.target?.result as string) || "", spaceText: "" };
         loadedCount++;
-        if (loadedCount === selectedFiles.length) {
+        if (loadedCount === imgs.length) {
           setFileItems(function (prev) { return prev.concat(newItems); });
-          e.target.value = "";
         }
       };
       reader.readAsDataURL(fileToUse);
     });
   }, []);
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+
+  const handleFileChange = useCallback(function (e: React.ChangeEvent<HTMLInputElement>) {
+    addFiles(Array.from(e.target.files || []));
+    e.target.value = "";
+  }, [addFiles]);
+
+  const handleDrop = useCallback(function (e: React.DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    setDragOver(false);
+    var dt = e.dataTransfer;
+    if (dt && dt.files && dt.files.length > 0) addFiles(Array.from(dt.files));
+  }, [addFiles]);
 
   const removeFile = useCallback(function (index: number) {
     setFileItems(function (prev) { return prev.filter(function (_, i) { return i !== index; }); });
@@ -265,6 +281,20 @@ export default function UploadPage() {
       setAiContent(aiContentRef.current);
     });
 
+    es.addEventListener("batch_start", function (e: MessageEvent) {
+      var d = JSON.parse(e.data);
+      addLog("info", "📦 开始批次 " + d.batch + "/" + d.totalBatches + "（" + d.imageCount + " 张）");
+      // 新批开始时清空 AI 内容显示区，避免上一批内容残留
+      aiContentRef.current = "";
+      setAiContent("");
+    });
+
+    es.addEventListener("batch_done", function (e: MessageEvent) {
+      var d = JSON.parse(e.data);
+      if (d.status === "success") addLog("ok", "✓ 批次 " + d.batch + "/" + d.totalBatches + " 完成");
+      else addLog("error", "✗ 批次 " + d.batch + "/" + d.totalBatches + " 失败：" + (d.error || ""));
+    });
+
     // tail_wait 由客户端计时器接管，这里不再覆盖（避免与服务端心跳竞争）
 
     es.addEventListener("image_done", function (e: MessageEvent) {
@@ -280,6 +310,18 @@ export default function UploadPage() {
       addLog("ok", "🎉 全部完成");
       setResults(d.results || []);
       setStage("completed");
+      es.close();
+    });
+
+    es.addEventListener("paused", function (e: MessageEvent) {
+      if (aiTimerRef.current) { clearInterval(aiTimerRef.current); aiTimerRef.current = null; }
+      try {
+        var d = JSON.parse(e.data);
+        addLog("info", "⏸ " + (d.message || "本段时间预算用完，剩余批次转入后台继续"));
+      } catch (_) {
+        addLog("info", "⏸ 本段时间预算用完，剩余批次转入后台继续");
+      }
+      setStage("failed");
       es.close();
     });
 
@@ -392,12 +434,24 @@ export default function UploadPage() {
             )}
           </div>
 
-          {/* 文件选择 */}
+          {/* 文件选择 / 拖拽区 */}
           <div className="mb-4">
             <label className="block mb-2 font-medium">选择图片文件</label>
-            <input type="file" accept="image/*" multiple onChange={handleFileChange}
-              className="w-full p-2 border border-gray-300 rounded-lg" />
-            <p className="text-xs text-gray-400 mt-1">可同时选择多张图片。处理过程实时反馈，关闭页面会转入后台继续。</p>
+            <input ref={fileInputRef} type="file" accept="image/*" multiple onChange={handleFileChange}
+              className="hidden" />
+            <div
+              onClick={function () { if (fileInputRef.current) fileInputRef.current.click(); }}
+              onDragOver={function (e) { e.preventDefault(); setDragOver(true); }}
+              onDragLeave={function () { setDragOver(false); }}
+              onDrop={handleDrop}
+              className={"w-full min-h-[120px] flex flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed cursor-pointer transition-colors py-6 " + (
+                dragOver ? "border-blue-500 bg-blue-50" : "border-gray-300 hover:border-blue-400 hover:bg-gray-50"
+              )}
+            >
+              <span className="text-3xl">🖼️</span>
+              <span className="text-sm font-medium text-gray-700">{dragOver ? "松开即可添加" : "点击选择，或拖拽图片到此"}</span>
+              <span className="text-xs text-gray-400">支持多张同时选择 · 处理过程实时反馈 · 关闭页面会转入后台继续</span>
+            </div>
           </div>
 
           {/* 上传按钮 */}

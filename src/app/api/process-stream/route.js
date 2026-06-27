@@ -107,12 +107,26 @@ export async function GET(req) {
           heartbeat: heartbeat,
         });
 
-        await updateJobStatus(jobId, result.success ? "completed" : "failed", result.results, result.error);
-
-        if (result.success) {
-          send("complete", { results: result.results });
+        if (result.stopped) {
+          // 时间预算中止：仍有 pending 批 → 置 pending 触发后台续跑，告知前端转入后台
+          try {
+            await axios.post(MEILI() + "/indexes/processing_jobs/documents",
+              [{ id: jobId, status: "pending", processingLock: 0, results: result.results, batches: result.batches, aiPhase: "paused", updatedAt: Date.now() }],
+              { headers: H() });
+          } catch (_) {}
+          // fire-and-forget 触发后台接力
+          try {
+            var base = process.env.VERCEL_URL ? "https://" + process.env.VERCEL_URL : (process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000");
+            fetch(base + "/api/process-queue", { method: "GET", headers: { "x-api-key": "internal" } }).catch(function () {});
+          } catch (_) {}
+          send("paused", { message: "本段时间预算用完，剩余批次已转入后台继续", results: result.results });
         } else {
-          send("fatal", { stage: "final", message: result.error || "处理失败", results: result.results });
+          await updateJobStatus(jobId, result.success ? "completed" : "failed", result.results, result.error);
+          if (result.success) {
+            send("complete", { results: result.results });
+          } else {
+            send("fatal", { stage: "final", message: result.error || "处理失败", results: result.results });
+          }
         }
       } catch (err) {
         console.error("[stream] 流水线异常:", err && err.stack || err && err.message || err);

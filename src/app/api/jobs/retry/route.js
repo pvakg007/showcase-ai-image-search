@@ -54,6 +54,18 @@ export async function POST(req) {
       return r;
     });
 
+    // 重置 failed 批为 pending（done 批保留，续跑时跳过）
+    var resetBatches = (job.batches || []).map(function (b) {
+      if (!b) return b;
+      if (b.status === "failed") return Object.assign({}, b, { status: "pending", error: "" });
+      return b;
+    });
+
+    // 追加 progressLog
+    var log = Array.isArray(job.progressLog) ? job.progressLog.slice() : [];
+    log.push({ ts: Date.now(), event: "retry", msg: "管理员手动重试，重置失败批次" });
+    if (log.length > 30) log = log.slice(-30);
+
     await axios.post(
       process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/documents",
       [{
@@ -63,6 +75,8 @@ export async function POST(req) {
         nextRetryAt: null,
         processingLock: 0,
         results: resetResults,
+        batches: resetBatches,
+        progressLog: log,
         updatedAt: Date.now(),
       }],
       { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }

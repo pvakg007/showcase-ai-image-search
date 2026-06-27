@@ -70,6 +70,12 @@ export async function GET(req) {
       // 是否所有文件都已处理（有 compressedSize 视为已压缩/转换过）
       var compressedCount = files.filter(function (f) { return !!f.compressedKey; }).length;
 
+      // 批次进度
+      var batches = Array.isArray(j.batches) ? j.batches : [];
+      var totalBatches = batches.length;
+      var doneBatches = batches.filter(function (b) { return b && b.status === "done"; }).length;
+      var failedBatches = batches.filter(function (b) { return b && b.status === "failed"; }).length;
+
       return {
         id: j.id,
         type: j.type,
@@ -87,6 +93,17 @@ export async function GET(req) {
         updatedAt: j.updatedAt,
         totalFinalSize: totalFinalSize,
         compressedCount: compressedCount,
+        // 批次进度（不含 aiRaw，避免载荷过大）
+        totalBatches: totalBatches,
+        doneBatches: doneBatches,
+        failedBatches: failedBatches,
+        batches: batches.map(function (b) {
+          return b ? { index: b.index, status: b.status, error: b.error || "", startedAt: b.startedAt || 0, completedAt: b.completedAt || 0 } : null;
+        }),
+        // 监管日志（最近 8 条）
+        progressLog: (Array.isArray(j.progressLog) ? j.progressLog : []).slice(-8).map(function (p) {
+          return { ts: p.ts || 0, event: p.event || "", msg: p.msg || "" };
+        }),
         // 可搜索的文件名（成功结果的标题）
         resultTitles: results
           .filter(function (r) { return r && r.status === "success" && r.title; })

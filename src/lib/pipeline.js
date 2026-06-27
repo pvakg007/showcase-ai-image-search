@@ -489,156 +489,224 @@ export async function runPipeline(job, opts) {
   }
   heartbeat();
 
-  // ============ Phase 2: AI 调用（一次批量调用，带断点续跑）============
-  var analysisRaw = job.aiRaw || null;
-  var analysis = null;
-  var firstFrameMs = 0;
+  // ============ Phase 2+3: 按 BATCH_SIZE 张分批调用 AI，每批返回后立即写结果 ============
+  var BATCH_SIZE = 5;
+  var TIME_BUDGET_MS = 240000; // 接近 Vercel maxDuration(290s) 就安全停，等后台续跑
 
-  if (analysisRaw) {
-    // 断点续跑：已有 AI 结果 → 直接复用，跳过 AI 调用
-    analysis = tryParseJson(analysisRaw);
-    plog("Phase2 跳过：复用已保存 AI 结果（断点续跑）");
-    onEvent("stage", { stage: "ai_resumed", note: "复用已保存的 AI 结果，跳过调用" });
-  } else {
-    var validImages = imageList.filter(function (x) { return !x.error; });
-    plog("Phase2 开始：AI 调用，有效图片 " + validImages.length + "/" + imageList.length);
-    var promptContent = await readPrompt(cos, aiSettings);
-    if (!promptContent) {
-      promptContent = getDefaultPrompt();
-    }
+  // 确定性分批（按全局顺序），续跑时划分一致
+  var batchGroups = [];
+  for (var bg = 0; bg < imageList.length; bg += BATCH_SIZE) {
+    batchGroups.push(imageList.slice(bg, bg + BATCH_SIZE));
+  }
+  var totalBatches = batchGroups.length;
 
-    var promptLabels = imageList.map(function (img, idx) {
-      if (img.error) return "图" + (idx + 1) + "：加载失败";
-      var label = Array.isArray(img.spaceNames) && img.spaceNames.length > 0 ? img.spaceNames.join("、") : "未命名空间";
-      return "图" + (idx + 1) + "：" + label;
-    });
-    var fullPrompt = "本次分析共 " + imageList.length + " 张图片：\n" + promptLabels.join("\n") + "\n\n" + promptContent;
+  // batches checkpoint（断点续跑用）
+  var batches = (Array.isArray(job.batches) && job.batches.length === totalBatches)
+    ? job.batches.slice()
+    : batchGroups.map(function (_, bi) { return { index: bi, status: "pending", startedAt: 0, completedAt: 0, error: "" }; });
 
-    var baseUrl = aiSettings.aiUrl.replace(/\/+$/, "");
-    var chatUrl = baseUrl.indexOf("/chat/completions") === -1 ? baseUrl + "/chat/completions" : baseUrl;
-
-    var messages = [{ role: "user", content: [{ type: "text", text: fullPrompt }] }];
-    var payloadBytes = 0;
-    for (var img of imageList) {
-      if (img.compressed && !img.error) {
-        var b64 = img.compressed.toString("base64");
-        payloadBytes += b64.length;
-        messages[0].content.push({
-          type: "image_url",
-          image_url: { url: "data:image/jpeg;base64," + b64 },
-        });
-      }
-    }
-    plog("Phase2 构建请求完成: payload=" + payloadBytes + "B (" + (payloadBytes / 1024 / 1024).toFixed(2) + "MB)，提交到 " + chatUrl);
-
-    var openaiBody = { model: aiSettings.aiModel, stream: true, max_tokens: 8192, messages: messages };
-    var openaiHeaders = {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer " + aiSettings.aiKey,
-      "x-dashscope-api-key": aiSettings.aiKey,
-    };
-
-    onEvent("ai_submit", { totalImages: validImages.length, payloadBytes: payloadBytes, model: aiSettings.aiModel });
-    heartbeat();
-    var aiT0 = Date.now();
-
-    var streamResult = await streamAiResponse(chatUrl, openaiBody, openaiHeaders, {
-      onFirstFrame: function (ms) { plog("Phase2 AI 首帧到达: " + ms + "ms"); onEvent("first_frame", { elapsedMs: ms }); firstFrameMs = ms; },
-      onChunk: function (delta) { onEvent("content", { chunk: delta }); heartbeat(); },
-      onTailWait: function (elapsedSec, sinceFirstSec) { onEvent("tail_wait", { elapsedSec: elapsedSec, sinceFirstSec: sinceFirstSec }); },
-    });
-    plog("Phase2 AI 调用返回: " + (streamResult && streamResult.content ? "成功 " + streamResult.content.length + "字符" : "失败 " + (streamResult && streamResult.error)) + " (总" + (Date.now() - aiT0) + "ms)");
-
-    if (!streamResult || !streamResult.content) {
-      var aiErr = (streamResult && streamResult.error) || "AI 分析未返回有效内容";
-      plog("Phase2 失败，终止: " + aiErr);
-      onEvent("error", { stage: "ai", message: aiErr });
-      return { success: false, results: results, error: aiErr };
-    }
-
-    analysisRaw = streamResult.content;
-    analysis = tryParseJson(analysisRaw);
-    if (!analysis) {
-      onEvent("error", { stage: "parse", message: "AI 返回非 JSON 格式" });
-      return { success: false, results: results, error: "AI 返回非 JSON 格式" };
-    }
-
-    // 写入断点 checkpoint：保存原始 AI 结果（续跑时跳过 AI 调用）
-    await updateJob(jobId, { aiRaw: analysisRaw, aiFirstFrameMs: firstFrameMs });
+  // progressLog（内存维护，随 checkpoint 一起写回）
+  var progressLog = Array.isArray(job.progressLog) ? job.progressLog.slice() : [];
+  function logProgress(event, msg) {
+    progressLog.push({ ts: Date.now(), event: event, msg: msg });
+    if (progressLog.length > 30) progressLog = progressLog.slice(-30);
+  }
+  async function checkpointBatches() {
+    try { await updateJob(jobId, { batches: batches, results: results, progressLog: progressLog }); }
+    catch (err) { plog("checkpoint 写回失败（不阻塞）: " + err.message); }
   }
 
-  // ============ Phase 3: 逐图写结果（MD / JSON / 索引，幂等）============
-  plog("Phase3 开始：逐图写结果（" + imageList.length + " 张）");
-  for (var j = 0; j < imageList.length; j++) {
+  var promptContent = await readPrompt(cos, aiSettings);
+  if (!promptContent) promptContent = getDefaultPrompt();
+  var baseUrl = aiSettings.aiUrl.replace(/\/+$/, "");
+  var chatUrl = baseUrl.indexOf("/chat/completions") === -1 ? baseUrl + "/chat/completions" : baseUrl;
+  var openaiHeaders = {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer " + aiSettings.aiKey,
+    "x-dashscope-api-key": aiSettings.aiKey,
+  };
+
+  plog("Phase2+3 开始：共 " + totalBatches + " 批（每批≤" + BATCH_SIZE + "）");
+  var stopped = false; // 是否因时间预算中止（仍有 pending 批，需后台续跑）
+
+  for (var bi = 0; bi < batchGroups.length; bi++) {
     heartbeat();
-    var img2 = imageList[j];
-    if (img2.error) {
-      results[j] = { imageIndex: j, status: "failed", error: img2.error, spaceNames: img2.spaceNames };
-      plog("图" + (j + 1) + " 跳过（有错误）");
-      onEvent("image_done", { index: j + 1, total: imageList.length, status: "failed", error: img2.error });
+    // 时间预算守卫：接近 maxDuration 就安全停，绝不被杀在批中间
+    if (Date.now() - pipeStart > TIME_BUDGET_MS) {
+      plog("接近 maxDuration，安全中止，剩余 " + (totalBatches - bi) + " 批待后台续跑");
+      logProgress("time_budget_stop", "剩余" + (totalBatches - bi) + "批等待后台续跑");
+      await checkpointBatches();
+      stopped = true;
+      break;
+    }
+
+    // 已完成的批 → 跳过（断点续跑）
+    if (batches[bi] && batches[bi].status === "done") {
+      plog("批 " + (bi + 1) + "/" + totalBatches + " 跳过（已完成）");
       continue;
     }
 
-    var imageIndex = j + 1; // 1-based，用于 (图N) 过滤
-    var searchFields = extractSearchFields(analysis, imageIndex, img2.spaceNames);
-    var docId = stableDocId(jobId, j);
-    var ts = docId;
+    var batchImages = batchGroups[bi];
+    var globalBase = bi * BATCH_SIZE; // 该批首图全局下标
+    var validBatch = batchImages.filter(function (x) { return !x.error; });
 
-    var mdContent = buildMarkdown(analysis, img2.url, ts, img2.spaceNames, imageIndex);
-    var basename = path.basename(img2.compressedKey).replace(/\.[^.]+$/, "");
-    var mdKey = "summaries/" + ts + "-" + basename + ".md";
-
-    try {
-      await new Promise(function (resolve, reject) {
-        cos.putObject({
-          Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION,
-          Key: mdKey, Body: Buffer.from(mdContent, "utf-8"),
-          ContentType: "text/markdown; charset=utf-8", ACL: "public-read",
-        }, function (err) { if (err) reject(err); else resolve(); });
+    // 该批全是错误图 → 直接标记 done（无需 AI）
+    if (validBatch.length === 0) {
+      batchImages.forEach(function (img, k) {
+        results[globalBase + k] = { imageIndex: globalBase + k, status: "failed", error: (img && img.error) || "无有效图片", spaceNames: img.spaceNames };
       });
-    } catch (err) {
-      plog("图" + (j + 1) + " MD 写入失败: " + err.message);
-    }
-    var mdUrl = "https://" + bucketDomain + "/" + mdKey;
-
-    // 原始分析 JSON
-    var rawKey = mdKey.replace(/\.md$/, ".json");
-    cos.putObject({
-      Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION,
-      Key: rawKey, Body: Buffer.from(analysisRaw, "utf-8"),
-      ContentType: "application/json; charset=utf-8", ACL: "public-read",
-    }, function () {});
-
-    // 索引到 Meilisearch（幂等 upsert，id 稳定）
-    var doc = {
-      id: docId, url: img2.url, mdUrl: mdUrl,
-      title: searchFields.title, summary: searchFields.summary, tags: searchFields.tags,
-      spaceNames: img2.spaceNames || [],
-      spaceName: (img2.spaceNames || []).join("、"),
-      projectName: job.projectName || "",
-      createdAt: ts, batchId: jobId || "",
-    };
-    try {
-      await axios.post(
-        process.env.MEILISEARCH_HOST + "/indexes/design_images/documents", [doc],
-        { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
-      );
-    } catch (err) {
-      console.warn("Meilisearch 索引失败:", err.message);
+      batches[bi] = { index: bi, status: "done", startedAt: 0, completedAt: Date.now(), error: "" };
+      await checkpointBatches();
+      plog("批 " + (bi + 1) + "/" + totalBatches + " 无有效图，直接完成");
+      continue;
     }
 
-    results[j] = {
-      imageIndex: j, status: "success",
-      title: searchFields.title, summary: searchFields.summary,
-      tags: searchFields.tags, mdUrl: mdUrl, url: img2.url, spaceNames: img2.spaceNames,
-    };
-    plog("图" + (j + 1) + " 结果写入完成: " + searchFields.title);
-    onEvent("image_done", { index: j + 1, total: imageList.length, status: "success", title: searchFields.title });
+    // 构建本批 prompt（本地图索引 1..K，仅该批有效图）
+    var promptLabels = validBatch.map(function (img, k) {
+      var label = Array.isArray(img.spaceNames) && img.spaceNames.length > 0 ? img.spaceNames.join("、") : "未命名空间";
+      return "图" + (k + 1) + "：" + label;
+    });
+    var fullPrompt = "本次分析共 " + validBatch.length + " 张图片：\n" + promptLabels.join("\n") + "\n\n" + promptContent;
+
+    var messages = [{ role: "user", content: [{ type: "text", text: fullPrompt }] }];
+    var payloadBytes = 0;
+    validBatch.forEach(function (img) {
+      if (img.compressed) {
+        var b64 = img.compressed.toString("base64");
+        payloadBytes += b64.length;
+        messages[0].content.push({ type: "image_url", image_url: { url: "data:image/jpeg;base64," + b64 } });
+      }
+    });
+    var openaiBody = { model: aiSettings.aiModel, stream: true, max_tokens: 8192, messages: messages };
+
+    onEvent("batch_start", { batch: bi + 1, totalBatches: totalBatches, imageCount: validBatch.length, model: aiSettings.aiModel });
+    onEvent("ai_submit", { totalImages: validBatch.length, payloadBytes: payloadBytes, model: aiSettings.aiModel, batch: bi + 1 });
+    heartbeat();
+    var aiT0 = Date.now();
+    plog("批 " + (bi + 1) + "/" + totalBatches + " 提交 AI: " + validBatch.length + " 张，payload " + (payloadBytes / 1024 / 1024).toFixed(2) + "MB");
+
+    batches[bi] = { index: bi, status: "processing", startedAt: Date.now(), completedAt: 0, error: "" };
+    await updateJob(jobId, { batches: batches });
+
+    var streamResult = await streamAiResponse(chatUrl, openaiBody, openaiHeaders, {
+      onFirstFrame: function (ms) { plog("批 " + (bi + 1) + " 首帧: " + ms + "ms"); onEvent("first_frame", { elapsedMs: ms, batch: bi + 1 }); },
+      onChunk: function (delta) { onEvent("content", { chunk: delta, batch: bi + 1 }); heartbeat(); },
+      onTailWait: function (elapsedSec, sinceFirstSec) { onEvent("tail_wait", { elapsedSec: elapsedSec, sinceFirstSec: sinceFirstSec }); },
+    });
+    plog("批 " + (bi + 1) + " AI 返回: " + (streamResult && streamResult.content ? "成功 " + streamResult.content.length + "字符" : "失败 " + (streamResult && streamResult.error)) + " (" + (Date.now() - aiT0) + "ms)");
+
+    // 失败处理：标记该批 failed，该批结果置失败，继续下一批（不整体中止）
+    if (!streamResult || !streamResult.content) {
+      var aiErr = (streamResult && streamResult.error) || "AI 分析未返回有效内容";
+      plog("批 " + (bi + 1) + " 失败: " + aiErr);
+      batches[bi] = { index: bi, status: "failed", startedAt: batches[bi].startedAt, completedAt: Date.now(), error: aiErr };
+      batchImages.forEach(function (img, k) {
+        results[globalBase + k] = { imageIndex: globalBase + k, status: "failed", error: (img && img.error) || aiErr, spaceNames: img.spaceNames };
+      });
+      logProgress("batch_failed", "批" + (bi + 1) + "/" + totalBatches + "失败: " + aiErr);
+      await checkpointBatches();
+      onEvent("batch_done", { batch: bi + 1, totalBatches: totalBatches, status: "failed", error: aiErr });
+      continue;
+    }
+
+    var analysisRaw = streamResult.content;
+    var analysis = tryParseJson(analysisRaw);
+    if (!analysis) {
+      plog("批 " + (bi + 1) + " AI 返回非 JSON");
+      batches[bi] = { index: bi, status: "failed", startedAt: batches[bi].startedAt, completedAt: Date.now(), error: "AI 返回非 JSON" };
+      batchImages.forEach(function (img, k) {
+        results[globalBase + k] = { imageIndex: globalBase + k, status: "failed", error: (img && img.error) || "AI 返回非 JSON", spaceNames: img.spaceNames };
+      });
+      logProgress("batch_failed", "批" + (bi + 1) + "/" + totalBatches + " AI 返回非 JSON");
+      await checkpointBatches();
+      onEvent("batch_done", { batch: bi + 1, totalBatches: totalBatches, status: "failed", error: "AI 返回非 JSON" });
+      continue;
+    }
+
+    // 该批 AI 成功 → 立即为每张图写结果（用批内本地索引过滤 (图K)）
+    for (var k = 0; k < batchImages.length; k++) {
+      heartbeat();
+      var img2 = batchImages[k];
+      var globalIdx = globalBase + k;
+      if (img2.error) {
+        results[globalIdx] = { imageIndex: globalIdx, status: "failed", error: img2.error, spaceNames: img2.spaceNames };
+        onEvent("image_done", { index: globalIdx + 1, total: imageList.length, status: "failed", error: img2.error });
+        continue;
+      }
+      // 找该图在 validBatch 中的本地位置（1-based）
+      var localIndex = 1;
+      for (var vk = 0; vk < validBatch.length; vk++) {
+        if (validBatch[vk] === img2) { localIndex = vk + 1; break; }
+      }
+      var searchFields = extractSearchFields(analysis, localIndex, img2.spaceNames);
+      var docId = stableDocId(jobId, globalIdx);
+      var ts = docId;
+
+      var mdContent = buildMarkdown(analysis, img2.url, ts, img2.spaceNames, localIndex);
+      var basename = path.basename(img2.compressedKey).replace(/\.[^.]+$/, "");
+      var mdKey = "summaries/" + ts + "-" + basename + ".md";
+
+      try {
+        await new Promise(function (resolve, reject) {
+          cos.putObject({
+            Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION,
+            Key: mdKey, Body: Buffer.from(mdContent, "utf-8"),
+            ContentType: "text/markdown; charset=utf-8", ACL: "public-read",
+          }, function (err) { if (err) reject(err); else resolve(); });
+        });
+      } catch (err) {
+        plog("图" + (globalIdx + 1) + " MD 写入失败: " + err.message);
+      }
+      var mdUrl = "https://" + bucketDomain + "/" + mdKey;
+
+      // 原始分析 JSON
+      cos.putObject({
+        Bucket: process.env.COS_BUCKET, Region: process.env.COS_REGION,
+        Key: mdKey.replace(/\.md$/, ".json"), Body: Buffer.from(analysisRaw, "utf-8"),
+        ContentType: "application/json; charset=utf-8", ACL: "public-read",
+      }, function () {});
+
+      // 索引到 Meilisearch（幂等 upsert，id 稳定）
+      var doc = {
+        id: docId, url: img2.url, mdUrl: mdUrl,
+        title: searchFields.title, summary: searchFields.summary, tags: searchFields.tags,
+        spaceNames: img2.spaceNames || [],
+        spaceName: (img2.spaceNames || []).join("、"),
+        projectName: job.projectName || "",
+        createdAt: ts, batchId: jobId || "",
+      };
+      try {
+        await axios.post(
+          process.env.MEILISEARCH_HOST + "/indexes/design_images/documents", [doc],
+          { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
+        );
+      } catch (err) {
+        console.warn("Meilisearch 索引失败:", err.message);
+      }
+
+      results[globalIdx] = {
+        imageIndex: globalIdx, status: "success",
+        title: searchFields.title, summary: searchFields.summary,
+        tags: searchFields.tags, mdUrl: mdUrl, url: img2.url, spaceNames: img2.spaceNames,
+      };
+      plog("图" + (globalIdx + 1) + " 结果写入完成: " + searchFields.title);
+      onEvent("image_done", { index: globalIdx + 1, total: imageList.length, status: "success", title: searchFields.title });
+    }
+
+    batches[bi] = { index: bi, status: "done", startedAt: batches[bi].startedAt, completedAt: Date.now(), error: "" };
+    logProgress("batch_done", "批" + (bi + 1) + "/" + totalBatches + "完成（" + validBatch.length + "张）");
+    await checkpointBatches();
+    onEvent("batch_done", { batch: bi + 1, totalBatches: totalBatches, status: "success" });
+    plog("批 " + (bi + 1) + "/" + totalBatches + " 完成");
   }
 
-  var allSuccess = results.every(function (r) { return r && r.status === "success"; });
-  plog("流水线结束: " + (allSuccess ? "全部成功" : "部分失败") + " (总耗时 " + (Date.now() - pipeStart) + "ms)");
-  return { success: allSuccess, results: results, error: allSuccess ? null : "部分图片处理失败" };
+  // 汇总结果
+  var anyBatchFailed = batches.some(function (b) { return b && b.status === "failed"; });
+  var finalError = stopped
+    ? "时间预算中止，等待后台续跑"
+    : (anyBatchFailed ? "部分批次失败" : null);
+  plog("流水线结束: " + (finalError || "全部成功") + " (总耗时 " + (Date.now() - pipeStart) + "ms)");
+  return { success: !finalError, stopped: stopped, results: results, batches: batches, error: finalError };
 }
 
 // ============================================================

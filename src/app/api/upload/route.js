@@ -91,6 +91,8 @@ export async function POST(req) {
       projectName: projectName,
       files: jobFiles,
       results: [],
+      batches: [],       // 分批 checkpoint（runPipeline 填充）
+      progressLog: [],   // 监管日志（批次完成/失败/恢复等）
       retryCount: 0,
       maxRetries: 2,
       nextRetryAt: null,
