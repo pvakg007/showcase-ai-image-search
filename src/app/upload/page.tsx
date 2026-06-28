@@ -138,8 +138,6 @@ export default function UploadPage() {
     addLog("info", "🔄 开始后台轮询任务状态（每 15s）");
     var tick = async function () {
       try {
-        // nudge：触发后台续跑（带 jobId 直达）
-        fetch("/api/process-queue?jobId=" + encodeURIComponent(jobId)).catch(function () {});
         var res = await fetch("/api/jobs/status?jobId=" + encodeURIComponent(jobId));
         var data = await res.json();
         if (data && data.success) {
@@ -155,6 +153,10 @@ export default function UploadPage() {
             stopPolling();
           } else {
             addLog("info", "⏳ 后台处理中… " + d.processed + "/" + d.totalImages);
+            // 仅当任务仍处于 pending（未被任何调用接手）时才 nudge，避免重复调用堆积
+            if (d.status === "pending") {
+              fetch("/api/process-queue?jobId=" + encodeURIComponent(jobId)).catch(function () {});
+            }
           }
         }
       } catch (_) {}
