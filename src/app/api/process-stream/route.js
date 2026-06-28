@@ -114,10 +114,10 @@ export async function GET(req) {
               [{ id: jobId, status: "pending", processingLock: 0, results: result.results, batches: result.batches, aiPhase: "paused", updatedAt: Date.now() }],
               { headers: H() });
           } catch (_) {}
-          // fire-and-forget 触发后台接力
+          // fire-and-forget 触发后台接力（带 jobId 直达，避开索引延迟）
           try {
             var base = process.env.VERCEL_URL ? "https://" + process.env.VERCEL_URL : (process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000");
-            fetch(base + "/api/process-queue", { method: "GET", headers: { "x-api-key": "internal" } }).catch(function () {});
+            fetch(base + "/api/process-queue?jobId=" + encodeURIComponent(jobId), { method: "GET", headers: { "x-api-key": "internal" } }).catch(function () {});
           } catch (_) {}
           send("paused", { message: "本段时间预算用完，剩余批次已转入后台继续", results: result.results });
         } else {

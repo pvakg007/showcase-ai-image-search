@@ -95,6 +95,8 @@ export default function UploadPage() {
   const aiTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const aiSubmitAtRef = useRef(0);
   const aiFirstFrameAtRef = useRef(0);
+  const currentJobIdRef = useRef<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // 保持 stageRef 与 stage 同步，供 onerror 闭包读取最新值
   useEffect(function () { stageRef.current = stage; }, [stage]);
@@ -113,17 +115,53 @@ export default function UploadPage() {
     fetch("/api/process-queue").catch(function () {});
   }, []);
 
-  // 关闭时清理 SSE + AI 计时器
+  // 关闭时清理 SSE + AI 计时器 + 轮询
   useEffect(function () {
     return function () {
       if (esRef.current) esRef.current.close();
       if (aiTimerRef.current) clearInterval(aiTimerRef.current);
+      if (pollRef.current) clearInterval(pollRef.current);
     };
   }, []);
 
   const addLog = useCallback(function (type: LogLine["type"], text: string) {
     setLogs(function (prev) { return prev.concat([{ type: type, text: text, ts: Date.now() }]); });
   }, []);
+
+  // ===== 断线后的后台轮询：SSE 断开/暂停后，周期性查询任务状态并 nudge 续跑，直到终态 =====
+  const stopPolling = useCallback(function () {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  }, []);
+
+  const startPolling = useCallback(function (jobId: string) {
+    stopPolling();
+    addLog("info", "🔄 开始后台轮询任务状态（每 15s）");
+    var tick = async function () {
+      try {
+        // nudge：触发后台续跑（带 jobId 直达）
+        fetch("/api/process-queue?jobId=" + encodeURIComponent(jobId)).catch(function () {});
+        var res = await fetch("/api/jobs/status?jobId=" + encodeURIComponent(jobId));
+        var data = await res.json();
+        if (data && data.success) {
+          var d = data.data;
+          if (d.status === "completed") {
+            addLog("ok", "🎉 后台处理完成（轮询确认）");
+            setResults(d.results || []);
+            setStage("completed");
+            stopPolling();
+          } else if (d.status === "failed") {
+            addLog("error", "❌ 后台处理失败：" + (d.error || ""));
+            setStage("failed");
+            stopPolling();
+          } else {
+            addLog("info", "⏳ 后台处理中… " + d.processed + "/" + d.totalImages);
+          }
+        }
+      } catch (_) {}
+    };
+    tick();
+    pollRef.current = setInterval(tick, 15000);
+  }, [addLog, stopPolling]);
 
   // ============ 客户端预压缩（移动端也要保证小体积，避免 Vercel 超时）============
   async function compressImageClient(file: File, maxWidth = 1280, quality = 0.86): Promise<File> {
@@ -212,6 +250,8 @@ export default function UploadPage() {
   const openStream = useCallback(function (jobId: string, count: number) {
     setStage("streaming");
     setTotalImages(count);
+    currentJobIdRef.current = jobId;
+    stopPolling();
     setLogs([]);
     setCompressList([]);
     setAiContent("");
@@ -307,6 +347,7 @@ export default function UploadPage() {
     es.addEventListener("complete", function (e: MessageEvent) {
       var d = JSON.parse(e.data);
       if (aiTimerRef.current) { clearInterval(aiTimerRef.current); aiTimerRef.current = null; }
+      stopPolling();
       addLog("ok", "🎉 全部完成");
       setResults(d.results || []);
       setStage("completed");
@@ -321,6 +362,8 @@ export default function UploadPage() {
       } catch (_) {
         addLog("info", "⏸ 本段时间预算用完，剩余批次转入后台继续");
       }
+      // 剩余批次转入后台 → 启动轮询跟进直到完成
+      if (currentJobIdRef.current) startPolling(currentJobIdRef.current);
       setStage("failed");
       es.close();
     });
@@ -337,12 +380,14 @@ export default function UploadPage() {
     es.onerror = function () {
       if (aiTimerRef.current) { clearInterval(aiTimerRef.current); aiTimerRef.current = null; }
       if (stageRef.current === "streaming") {
-        addLog("warn", "连接中断，任务转入后台继续，稍后可在此页或管理后台查看结果");
+        addLog("warn", "连接中断，任务转入后台继续，已启动轮询跟进");
+        // 断线后启动轮询，确保剩余批次在后台完成并回传结果
+        if (currentJobIdRef.current) startPolling(currentJobIdRef.current);
         setStage("failed");
       }
       try { es.close(); } catch (_) {}
     };
-  }, [addLog]);
+  }, [addLog, startPolling, stopPolling]);
 
   // ============ 上传（XHR 进度） ============
   const handleUpload = useCallback(function (mode: "batch" | "individual") {

@@ -258,7 +258,7 @@ export async function streamAiResponse(url, body, headers, opts) {
   var accumulatedContent = "";
   var firstChunkReceived = false;
   var FIRST_CHUNK_TIMEOUT = 20000;
-  var FULL_TIMEOUT = 250000;
+  var FULL_TIMEOUT = 180000; // 单批 AI 上限 180s，保证一批+开销 < maxDuration(290s)，绝不批中途被杀
   var lastErrMsg = "";
   var startTime = Date.now();
   var firstFrameMs = 0;
@@ -491,7 +491,10 @@ export async function runPipeline(job, opts) {
 
   // ============ Phase 2+3: 按 BATCH_SIZE 张分批调用 AI，每批返回后立即写结果 ============
   var BATCH_SIZE = 5;
-  var TIME_BUDGET_MS = 240000; // 接近 Vercel maxDuration(290s) 就安全停，等后台续跑
+  // 时间预算：maxDuration(290s) - 单批AI(180s) - 写入/收尾(30s) = 80s。
+  // 仅当"已耗时 < 预算"才启动【新的】批（bi>0）；首批必跑。保证每批都能在 maxDuration 内完成，
+  // 绝不出现"开了第2批却中途被杀"。超预算 → stopped，交给后台下一轮续跑。
+  var TIME_BUDGET_MS = 80000;
 
   // 确定性分批（按全局顺序），续跑时划分一致
   var batchGroups = [];
@@ -531,9 +534,10 @@ export async function runPipeline(job, opts) {
 
   for (var bi = 0; bi < batchGroups.length; bi++) {
     heartbeat();
-    // 时间预算守卫：接近 maxDuration 就安全停，绝不被杀在批中间
-    if (Date.now() - pipeStart > TIME_BUDGET_MS) {
-      plog("接近 maxDuration，安全中止，剩余 " + (totalBatches - bi) + " 批待后台续跑");
+    // 时间预算守卫：仅对【非首批】生效。剩余时间不够再跑一批(FULL_TIMEOUT+收尾) → 安全停，交给后台续跑。
+    // 首批必跑（保证每次调用至少推进一批）；这样绝不会"开了批却中途被杀"。
+    if (bi > 0 && (Date.now() - pipeStart) > TIME_BUDGET_MS) {
+      plog("时间预算用尽，安全中止，剩余 " + (totalBatches - bi) + " 批待后台续跑");
       logProgress("time_budget_stop", "剩余" + (totalBatches - bi) + "批等待后台续跑");
       await checkpointBatches();
       stopped = true;

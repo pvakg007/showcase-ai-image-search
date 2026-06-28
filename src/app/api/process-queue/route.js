@@ -4,28 +4,39 @@ import { runPipeline } from "@/lib/pipeline";
 
 // 后台工作进程：恢复卡住任务 + 静默处理 pending 任务（无 SSE，用于断点续跑/重试）。
 // 在页面加载时 fire-and-forget 触发（main/admin/upload 页面），实现"关页面后下次访问续跑"。
+// 支持 ?jobId=xxx 直接处理指定任务（分批续跑用，避开 Meilisearch 写后索引延迟）。
 export const maxDuration = 290;
 
+var MEILI = function () { return process.env.MEILISEARCH_HOST; };
+var KEY = function () { return process.env.MEILISEARCH_API_KEY; };
+var H = function () { return { Authorization: "Bearer " + KEY(), "Content-Type": "application/json" }; };
+
 async function searchJobs(params) {
-  var res = await axios.post(
-    process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/search", params,
-    { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
-  );
+  var res = await axios.post(MEILI() + "/indexes/processing_jobs/search", params, { headers: H() });
   return res.data.hits || [];
 }
 
 async function updateJob(jobId, fields) {
-  await axios.post(
-    process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/documents",
-    [Object.assign({ id: jobId }, fields)],
-    { headers: { Authorization: "Bearer " + process.env.MEILISEARCH_API_KEY, "Content-Type": "application/json" } }
-  );
+  await axios.post(MEILI() + "/indexes/processing_jobs/documents",
+    [Object.assign({ id: jobId }, fields)], { headers: H() });
 }
 
-/** 恢复卡住的任务（processing 状态 > 2 分钟未心跳 → 视为函数已死，重置为 pending） */
-async function recoverStuckJobs() {
+/** 按 id 直接取任务文档（避开搜索的索引延迟） */
+async function getJobById(jobId) {
   try {
-    var cutoff = Date.now() - 2 * 60 * 1000;
+    var r = await axios.get(MEILI() + "/indexes/processing_jobs/documents/" + encodeURIComponent(jobId), { headers: { Authorization: "Bearer " + KEY() } });
+    return r.data || null;
+  } catch (_) { return null; }
+}
+
+/**
+ * 恢复卡住的任务（processing 状态 > 90s 未心跳 → 视为函数已死，重置为 pending）。
+ * 返回刚被重置的任务数组，供本次调用直接处理（避开"写后立即搜索"的索引延迟）。
+ */
+async function recoverStuckJobs() {
+  var reset = [];
+  try {
+    var cutoff = Date.now() - 90 * 1000;
     var stuckHits = await searchJobs({
       q: "",
       filter: 'status = "processing" AND processingLock < ' + cutoff,
@@ -34,40 +45,51 @@ async function recoverStuckJobs() {
     });
     for (var j of stuckHits) {
       console.log("[recovery] 恢复卡住的任务:", j.id);
-      // 重置为 pending，保留 files.compressedKey / batches 等断点 → runPipeline 从断点续跑
-      // 追加 progressLog 一条，向后台汇报恢复事件
       var log = Array.isArray(j.progressLog) ? j.progressLog.slice() : [];
       log.push({ ts: Date.now(), event: "recovered", msg: "卡住" + Math.round((Date.now() - (j.processingLock || cutoff)) / 1000) + "s 后被恢复机制捡起" });
       if (log.length > 30) log = log.slice(-30);
       await updateJob(j.id, { status: "pending", processingLock: 0, progressLog: log, updatedAt: Date.now() });
+      j.status = "pending";
+      reset.push(j);
     }
   } catch (_) {}
+  return reset;
 }
 
-/** 触发本服务下一次后台处理（fire-and-forget，用于分批续跑） */
-function triggerNext() {
+/** 触发下一次后台处理（fire-and-forget，带 jobId 直达，避开索引延迟） */
+function triggerNext(jobId) {
   try {
     var baseUrl = process.env.VERCEL_URL
       ? "https://" + process.env.VERCEL_URL
       : (process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000");
-    fetch(baseUrl + "/api/process-queue", { method: "GET", headers: { "x-api-key": "internal" } }).catch(function () {});
+    var url = baseUrl + "/api/process-queue";
+    if (jobId) url += "?jobId=" + encodeURIComponent(jobId);
+    fetch(url, { method: "GET", headers: { "x-api-key": "internal" } }).catch(function () {});
   } catch (_) {}
 }
 
-export async function GET() {
+export async function GET(req) {
   try {
-    await recoverStuckJobs();
+    var targetJobId = req && req.nextUrl ? req.nextUrl.searchParams.get("jobId") : null;
+    var recovered = await recoverStuckJobs();
 
-    var hits = await searchJobs({
-      q: "",
-      filter: 'status = "pending"',
-      limit: 1,
-      sort: ["createdAt:asc"],
-    });
-    if (hits.length === 0) {
+    // 选任务：优先 ?jobId 直达 → 否则搜 pending → 否则用刚恢复的（避开索引延迟）
+    var job = null;
+    if (targetJobId) {
+      job = await getJobById(targetJobId);
+      if (job && job.status !== "pending") job = null; // 非 pending 不处理（可能正被 SSE 处理）
+    }
+    if (!job) {
+      var hits = await searchJobs({ q: "", filter: 'status = "pending"', limit: 1, sort: ["createdAt:asc"] });
+      job = hits[0];
+    }
+    if (!job && recovered.length > 0) {
+      job = recovered[0];
+    }
+    if (!job) {
       return Response.json({ success: true, message: "暂无可处理的任务" });
     }
-    var job = hits[0];
+
     var jobId = job.id;
     if (!job.files || job.files.length === 0) {
       await updateJob(jobId, { status: "failed", results: [], error: "任务文件列表为空", updatedAt: Date.now() });
@@ -83,23 +105,27 @@ export async function GET() {
     if (result.stopped) {
       // 时间预算中止：仍有 pending 批 → 置 pending 并立即触发下一轮接力续跑（不标记 failed）
       await updateJob(jobId, { status: "pending", processingLock: 0, results: result.results, batches: result.batches, aiPhase: "paused", updatedAt: Date.now() });
-      triggerNext();
+      triggerNext(jobId);
       return Response.json({ success: true, message: "时间预算中止，已触发后台续跑", jobId: jobId });
     }
 
+    // 全部批次跑完（可能有失败的批）
+    var allDone = (result.batches || []).every(function (b) { return b && b.status !== "pending" && b.status !== "processing"; });
+    var anyFailed = (result.batches || []).some(function (b) { return b && b.status === "failed"; });
+    var success = allDone && !anyFailed;
     await updateJob(jobId, {
-      status: result.success ? "completed" : "failed",
+      status: success ? "completed" : "failed",
       results: result.results,
       batches: result.batches,
-      error: result.success ? null : result.error,
+      error: success ? null : (anyFailed ? "部分批次失败" : (result.error || "处理失败")),
       processingLock: 0,
-      aiPhase: result.success ? "done" : "failed",
+      aiPhase: success ? "done" : "failed",
       updatedAt: Date.now(),
     });
 
     return Response.json({
-      success: result.success,
-      message: result.success ? "处理完成" : (result.error || "部分失败"),
+      success: success,
+      message: success ? "处理完成" : "部分批次失败",
       jobId: jobId,
       results: result.results,
     });

@@ -89,8 +89,9 @@ export async function GET(req) {
         maxRetries: j.maxRetries || 2,
         nextRetryAt: j.nextRetryAt || null,
         processingLock: j.processingLock || 0,
-        createdAt: j.createdAt,
-        updatedAt: j.updatedAt,
+        // createdAt 兜底：旧任务可能缺该字段，jobId 本身就是上传时间戳
+        createdAt: j.createdAt || (function () { var n = parseInt(j.id, 10); return n > 1000000000 ? n : 0; })(),
+        updatedAt: j.updatedAt || j.createdAt || 0,
         totalFinalSize: totalFinalSize,
         compressedCount: compressedCount,
         // 批次进度（不含 aiRaw，避免载荷过大）
