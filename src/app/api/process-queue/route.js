@@ -91,16 +91,29 @@ export async function GET(req) {
     }
 
     var jobId = job.id;
+    console.log("[queue] 取到任务", jobId, "status=", job.status, "files=", (job.files ? job.files.length : "无"),
+      "batches=", (job.batches ? job.batches.length : "无"), "results=", (job.results ? job.results.length : "无"));
     if (!job.files || job.files.length === 0) {
-      await updateJob(jobId, { status: "failed", results: [], error: "任务文件列表为空", updatedAt: Date.now() });
+      // files 丢失（历史数据或并发踩踏）—— 不要清空已有 results，标记失败并保留诊断信息
+      console.error("[queue] 任务 files 为空，无法续跑:", jobId, JSON.stringify({ batches: job.batches, results: job.results }));
+      await updateJob(jobId, { status: "failed", error: "任务文件列表为空（files 字段丢失，可能需重新上传）", updatedAt: Date.now() });
       return Response.json({ success: false, error: "任务文件列表为空" });
     }
 
     // 锁定
     await updateJob(jobId, { status: "processing", processingLock: Date.now(), aiPhase: "running", updatedAt: Date.now() });
 
+    // heartbeat：节流刷新 processingLock（每 ~20s 一次），防止 AI 长等待时被 recoverStuckJobs 误重置
+    var lastLock = Date.now();
+    function bgHeartbeat() {
+      var now = Date.now();
+      if (now - lastLock < 18000) return;
+      lastLock = now;
+      try { updateJob(jobId, { processingLock: now, updatedAt: now }); } catch (_) {}
+    }
+
     // 静默跑流水线（onEvent 空 → 无推送，靠 batches 断点续跑）
-    var result = await runPipeline(job, { onEvent: function () {}, heartbeat: function () {} });
+    var result = await runPipeline(job, { onEvent: function () {}, heartbeat: bgHeartbeat });
 
     if (result.stopped) {
       // 时间预算中止：仍有 pending 批 → 置 pending 并立即触发下一轮接力续跑（不标记 failed）

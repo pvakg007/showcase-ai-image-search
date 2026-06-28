@@ -384,6 +384,11 @@ export async function runPipeline(job, opts) {
   function plog(msg) { console.log("[pipe +" + (Date.now() - pipeStart) + "ms] job=" + jobId + " " + msg); }
   plog("启动流水线，共 " + files.length + " 张图片，模式=" + (opts.onEvent ? "stream" : "background"));
 
+  // ===== 定时心跳：整个流水线期间每 20s 刷一次 processingLock。
+  // 关键：AI 首帧可能要 100s+，期间无数据流 → 旧的"按 chunk 触发 heartbeat"不生效，
+  // 锁会超过 recoverStuckJobs 阈值被误重置。用独立定时器保活，不依赖数据流。 =====
+  var keepalive = setInterval(function () { try { heartbeat(); } catch (_) {} }, 20000);
+
   var cos = await makeCos();
   var aiSettings = await readAiSettings(cos);
   plog("读取 AI 设置完成: model=" + aiSettings.aiModel + " url=" + (aiSettings.aiUrl || "(空)"));
@@ -515,7 +520,8 @@ export async function runPipeline(job, opts) {
     if (progressLog.length > 30) progressLog = progressLog.slice(-30);
   }
   async function checkpointBatches() {
-    try { await updateJob(jobId, { batches: batches, results: results, progressLog: progressLog }); }
+    // 每次都带上 files，防止任何局部写入意外丢失 files 字段（后台续跑依赖它）
+    try { await updateJob(jobId, { batches: batches, results: results, progressLog: progressLog, files: job.files || [] }); }
     catch (err) { plog("checkpoint 写回失败（不阻塞）: " + err.message); }
   }
 
@@ -710,6 +716,7 @@ export async function runPipeline(job, opts) {
     ? "时间预算中止，等待后台续跑"
     : (anyBatchFailed ? "部分批次失败" : null);
   plog("流水线结束: " + (finalError || "全部成功") + " (总耗时 " + (Date.now() - pipeStart) + "ms)");
+  clearInterval(keepalive);
   return { success: !finalError, stopped: stopped, results: results, batches: batches, error: finalError };
 }
 

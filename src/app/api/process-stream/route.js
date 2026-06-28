@@ -111,7 +111,7 @@ export async function GET(req) {
           // 时间预算中止：仍有 pending 批 → 置 pending 触发后台续跑，告知前端转入后台
           try {
             await axios.post(MEILI() + "/indexes/processing_jobs/documents",
-              [{ id: jobId, status: "pending", processingLock: 0, results: result.results, batches: result.batches, aiPhase: "paused", updatedAt: Date.now() }],
+              [{ id: jobId, status: "pending", processingLock: 0, results: result.results, batches: result.batches, files: job.files || [], aiPhase: "paused", updatedAt: Date.now() }],
               { headers: H() });
           } catch (_) {}
           // fire-and-forget 触发后台接力（带 jobId 直达，避开索引延迟）
