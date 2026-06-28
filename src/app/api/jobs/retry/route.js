@@ -63,7 +63,7 @@ export async function POST(req) {
 
     // 追加 progressLog
     var log = Array.isArray(job.progressLog) ? job.progressLog.slice() : [];
-    log.push({ ts: Date.now(), event: "retry", msg: "管理员手动重试，重置失败批次" });
+    log.push({ ts: Date.now(), event: "manual_retry", msg: "管理员手动重试，重置失败批次，重试次数清零（使用最新模型/网址 + 原有提示词）" });
     if (log.length > 30) log = log.slice(-30);
 
     await axios.post(
@@ -72,7 +72,7 @@ export async function POST(req) {
         id: jobId,
         status: "pending",
         retryCount: 0,
-        nextRetryAt: null,
+        nextRetryAt: 0,
         processingLock: 0,
         results: resetResults,
         batches: resetBatches,

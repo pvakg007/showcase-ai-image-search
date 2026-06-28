@@ -120,12 +120,26 @@ export async function GET(req) {
             fetch(base + "/api/process-queue?jobId=" + encodeURIComponent(jobId), { method: "GET", headers: { "x-api-key": "internal" } }).catch(function () {});
           } catch (_) {}
           send("paused", { message: "本段时间预算用完，剩余批次已转入后台继续", results: result.results });
+        } else if (result.success) {
+          await updateJobStatus(jobId, "completed", result.results, null);
+          send("complete", { results: result.results });
         } else {
-          await updateJobStatus(jobId, result.success ? "completed" : "failed", result.results, result.error);
-          if (result.success) {
-            send("complete", { results: result.results });
+          // 失败：与 process-queue 一致的自动重试逻辑（提示词用原有快照，模型/网址用最新）
+          var retryCount = (job.retryCount || 0) + 1;
+          var maxRetries = job.maxRetries != null ? job.maxRetries : 2;
+          if (retryCount <= maxRetries) {
+            var retryBatches = (result.batches || []).map(function (b) {
+              return b && b.status === "failed" ? Object.assign({}, b, { status: "pending", error: "" }) : b;
+            });
+            var backoffSec = retryCount * 60;
+            await axios.post(MEILI() + "/indexes/processing_jobs/documents",
+              [{ id: jobId, status: "pending", processingLock: 0, results: result.results, batches: retryBatches,
+                 retryCount: retryCount, nextRetryAt: Date.now() + backoffSec * 1000, aiPhase: "retrying",
+                 error: "部分批次失败，自动重试中", updatedAt: Date.now() }], { headers: H() });
+            send("paused", { message: "部分批次失败，已排定第 " + retryCount + "/" + maxRetries + " 次自动重试（" + backoffSec + "s 后），剩余在后台继续" });
           } else {
-            send("fatal", { stage: "final", message: result.error || "处理失败", results: result.results });
+            await updateJobStatus(jobId, "failed", result.results, "部分批次失败（自动重试已耗尽，请后台手动重试）");
+            send("fatal", { stage: "final", message: "部分批次失败，自动重试已耗尽，请在后台手动重试", results: result.results });
           }
         }
       } catch (err) {

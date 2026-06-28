@@ -145,6 +145,17 @@ export default function AdminPage() {
     }
   }, [authenticated, loadSettings]);
 
+  // 任务列表自动刷新（每 10s），让排队/重试/完成状态实时可见；
+  // 同时 nudge 后台队列，确保退避到期的重试任务被接起处理
+  useEffect(() => {
+    if (!authenticated) return;
+    var t = setInterval(function () {
+      loadJobList(jobFilter);
+      fetch("/api/process-queue").catch(function () {});
+    }, 10000);
+    return function () { clearInterval(t); };
+  }, [authenticated, jobFilter]);
+
   // ========== 首次设置 ==========
   var [showSetup, setShowSetup] = useState(false);
   var [setupUser, setSetupUser] = useState("");
@@ -639,16 +650,20 @@ export default function AdminPage() {
             ) : (
               <div className="space-y-2 max-h-96 overflow-y-auto">
                 {jobList.map(function (job: any) {
+                  // 重试中：pending 且 retryCount>0
+                  var isRetrying = job.status === "pending" && job.retryCount > 0;
                   var statusColor =
                     job.status === "completed" ? "text-green-600 bg-green-50" :
                     job.status === "failed" ? "text-red-600 bg-red-50" :
                     job.status === "processing" ? "text-blue-600 bg-blue-50" :
+                    isRetrying ? "text-orange-600 bg-orange-50" :
                     "text-yellow-600 bg-yellow-50";
                   var statusLabel =
                     job.status === "completed" ? "已完成" :
                     job.status === "failed" ? "失败" :
                     job.status === "processing" ? "处理中" :
-                    job.status === "pending" ? "等待中" : "重试中";
+                    isRetrying ? ("重试中 " + job.retryCount + "/" + (job.maxRetries || 2)) :
+                    "排队中";
                   var title = job.projectName || ("任务 " + String(job.id).slice(-8));
                   var compressedNote = (job.compressedCount > 0)
                     ? "已压缩/转换 " + job.compressedCount + "/" + job.totalImages

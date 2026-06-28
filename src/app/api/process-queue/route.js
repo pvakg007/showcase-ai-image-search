@@ -48,8 +48,9 @@ async function recoverStuckJobs() {
       var log = Array.isArray(j.progressLog) ? j.progressLog.slice() : [];
       log.push({ ts: Date.now(), event: "recovered", msg: "卡住" + Math.round((Date.now() - (j.processingLock || cutoff)) / 1000) + "s 后被恢复机制捡起" });
       if (log.length > 30) log = log.slice(-30);
-      await updateJob(j.id, { status: "pending", processingLock: 0, progressLog: log, updatedAt: Date.now() });
+      await updateJob(j.id, { status: "pending", processingLock: 0, nextRetryAt: 0, progressLog: log, updatedAt: Date.now() });
       j.status = "pending";
+      j.nextRetryAt = 0;
       reset.push(j);
     }
   } catch (_) {}
@@ -74,13 +75,16 @@ export async function GET(req) {
     var recovered = await recoverStuckJobs();
 
     // 选任务：优先 ?jobId 直达 → 否则搜 pending → 否则用刚恢复的（避开索引延迟）
+    var nowMs = Date.now();
     var job = null;
     if (targetJobId) {
       job = await getJobById(targetJobId);
-      if (job && job.status !== "pending") job = null; // 非 pending 不处理（可能正被 SSE 处理）
+      // 只处理 pending 且退避已到期的（非 pending 或还在退避中都不处理）
+      if (job && (job.status !== "pending" || (job.nextRetryAt && job.nextRetryAt > nowMs))) job = null;
     }
     if (!job) {
-      var hits = await searchJobs({ q: "", filter: 'status = "pending"', limit: 1, sort: ["createdAt:asc"] });
+      // pending 且 nextRetryAt <= now（退避到期）。nextRetryAt=0/缺失视为立即可处理。
+      var hits = await searchJobs({ q: "", filter: 'status = "pending" AND nextRetryAt <= ' + nowMs, limit: 1, sort: ["createdAt:asc"] });
       job = hits[0];
     }
     if (!job && recovered.length > 0) {
@@ -126,14 +130,42 @@ export async function GET(req) {
     var allDone = (result.batches || []).every(function (b) { return b && b.status !== "pending" && b.status !== "processing"; });
     var anyFailed = (result.batches || []).some(function (b) { return b && b.status === "failed"; });
     var success = allDone && !anyFailed;
+
+    if (success) {
+      await updateJob(jobId, {
+        status: "completed", results: result.results, batches: result.batches,
+        error: null, processingLock: 0, aiPhase: "done", updatedAt: Date.now(),
+      });
+      return Response.json({ success: true, message: "处理完成", jobId: jobId, results: result.results });
+    }
+
+    // 有批失败 → 自动重试（重试次数未超上限）
+    var retryCount = (job.retryCount || 0) + 1;
+    var maxRetries = job.maxRetries != null ? job.maxRetries : 2;
+    if (retryCount <= maxRetries) {
+      // 重置 failed 批为 pending（done 批保留）；下次 runPipeline 只重跑失败批
+      var retryBatches = (result.batches || []).map(function (b) {
+        if (b && b.status === "failed") return Object.assign({}, b, { status: "pending", error: "" });
+        return b;
+      });
+      var backoffSec = retryCount * 60; // 第1次重试等60s，第2次等120s（给大模型 API 缓冲）
+      var log = Array.isArray(job.progressLog) ? job.progressLog.slice() : [];
+      log.push({ ts: Date.now(), event: "auto_retry", msg: "第" + retryCount + "/" + maxRetries + "次自动重试（" + backoffSec + "s 后），重置失败批次" });
+      if (log.length > 30) log = log.slice(-30);
+      await updateJob(jobId, {
+        status: "pending", processingLock: 0, results: result.results, batches: retryBatches,
+        retryCount: retryCount, nextRetryAt: Date.now() + backoffSec * 1000,
+        progressLog: log, aiPhase: "retrying", error: "部分批次失败，自动重试中", updatedAt: Date.now(),
+      });
+      console.log("[queue] 任务", jobId, "第", retryCount, "次自动重试已排定，", backoffSec, "s 后执行");
+      return Response.json({ success: false, message: "部分批次失败，已排定自动重试 #" + retryCount, jobId: jobId });
+    }
+
+    // 自动重试耗尽 → 标记 failed，等用户后台手动重试
     await updateJob(jobId, {
-      status: success ? "completed" : "failed",
-      results: result.results,
-      batches: result.batches,
-      error: success ? null : (anyFailed ? "部分批次失败" : (result.error || "处理失败")),
-      processingLock: 0,
-      aiPhase: success ? "done" : "failed",
-      updatedAt: Date.now(),
+      status: "failed", results: result.results, batches: result.batches,
+      error: anyFailed ? "部分批次失败（自动重试已耗尽，请手动重试）" : (result.error || "处理失败"),
+      processingLock: 0, aiPhase: "failed", updatedAt: Date.now(),
     });
 
     return Response.json({

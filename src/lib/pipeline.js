@@ -525,8 +525,13 @@ export async function runPipeline(job, opts) {
     catch (err) { plog("checkpoint 写回失败（不阻塞）: " + err.message); }
   }
 
-  var promptContent = await readPrompt(cos, aiSettings);
+  // 提示词：优先用任务首次处理时快照的"原有提示词"（重试时保持不变）；
+  // 没有快照（首次处理）→ 读当前提示词并快照存盘。模型名/服务商网址始终用最新设置（readAiSettings 已读最新）。
+  var promptContent = job.promptSnapshot || await readPrompt(cos, aiSettings);
   if (!promptContent) promptContent = getDefaultPrompt();
+  if (!job.promptSnapshot) {
+    try { await updateJob(jobId, { promptSnapshot: promptContent }); job.promptSnapshot = promptContent; plog("已快照原有提示词（重试时保持不变）"); } catch (err) { plog("提示词快照失败（不阻塞）: " + err.message); }
+  }
   var baseUrl = aiSettings.aiUrl.replace(/\/+$/, "");
   var chatUrl = baseUrl.indexOf("/chat/completions") === -1 ? baseUrl + "/chat/completions" : baseUrl;
   var openaiHeaders = {

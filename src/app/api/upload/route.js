@@ -95,7 +95,7 @@ export async function POST(req) {
       progressLog: [],   // 监管日志（批次完成/失败/恢复等）
       retryCount: 0,
       maxRetries: 2,
-      nextRetryAt: null,
+      nextRetryAt: 0,
       processingLock: 0,
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -122,7 +122,7 @@ export async function POST(req) {
         process.env.MEILISEARCH_HOST + "/indexes/processing_jobs/settings",
         {
           searchableAttributes: ["id"],
-          filterableAttributes: ["status", "retryCount", "maxRetries", "processingLock"],
+          filterableAttributes: ["status", "retryCount", "maxRetries", "processingLock", "nextRetryAt"],
           sortableAttributes: ["createdAt", "nextRetryAt"],
         },
         {
