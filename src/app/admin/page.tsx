@@ -257,6 +257,18 @@ export default function AdminPage() {
     }
   }, [jobFilter]);
 
+  var deleteJob = useCallback(async (jobId: string) => {
+    var result = await adminFetch("/api/jobs/delete", {
+      method: "POST",
+      body: JSON.stringify({ jobId }),
+    });
+    if (result.success) {
+      loadJobList(jobFilter);
+    } else {
+      alert("删除失败: " + (result.error || "未知错误"));
+    }
+  }, [jobFilter]);
+
   // ========== 重新分析 ==========
   var handleReprocess = useCallback(async (item: ImageItem) => {
     setReprocessingId(item.id);
@@ -696,6 +708,15 @@ export default function AdminPage() {
                               title="任务卡住时强制重置并触发处理"
                             >
                               强制重试
+                            </button>
+                          )}
+                          {job.status !== "completed" && (
+                            <button
+                              onClick={function () { if (window.confirm("删除该任务记录？（已生成的图片不受影响）")) deleteJob(job.id); }}
+                              className="px-2 py-1 text-xs bg-gray-100 text-gray-500 rounded hover:bg-gray-200 transition-colors"
+                              title="删除任务记录"
+                            >
+                              ✕
                             </button>
                           )}
                         </div>
