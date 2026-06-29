@@ -44,9 +44,10 @@ export async function POST(req) {
     }
 
     var job = hits[0];
-    if (job.status !== "failed") {
-      return Response.json({ success: false, error: "只有失败状态的任务可以重试" }, { status: 400 });
+    if (job.status === "completed") {
+      return Response.json({ success: false, error: "已完成的任务无需重试" }, { status: 400 });
     }
+    // 其余状态（failed / pending / processing 卡住）都允许重试/强制重试
 
     // 重置失败的结果槽，保留成功的
     var resetResults = (job.results || []).map(function (r) {

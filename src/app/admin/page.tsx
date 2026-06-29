@@ -636,10 +636,11 @@ export default function AdminPage() {
                 );
               })}
               <button
-                onClick={function () { loadJobList(jobFilter); }}
+                onClick={function () { loadJobList(jobFilter); fetch("/api/process-queue").catch(function () {}); }}
                 className="px-3 py-1 text-xs bg-gray-100 text-gray-600 rounded hover:bg-gray-200 transition-colors ml-auto"
+                title="刷新列表并触发后台队列处理"
               >
-                刷新
+                刷新并处理
               </button>
             </div>
 
@@ -686,6 +687,15 @@ export default function AdminPage() {
                               className="px-2.5 py-1 text-xs bg-red-100 text-red-700 rounded hover:bg-red-200 transition-colors"
                             >
                               重试
+                            </button>
+                          )}
+                          {(job.status === "pending" || job.status === "processing") && (
+                            <button
+                              onClick={function () { if (window.confirm("强制重试该任务？会重置锁并立即触发处理。")) retryJob(job.id); }}
+                              className="px-2.5 py-1 text-xs bg-orange-100 text-orange-700 rounded hover:bg-orange-200 transition-colors"
+                              title="任务卡住时强制重置并触发处理"
+                            >
+                              强制重试
                             </button>
                           )}
                         </div>

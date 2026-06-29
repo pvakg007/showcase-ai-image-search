@@ -83,9 +83,12 @@ export async function GET(req) {
       if (job && (job.status !== "pending" || (job.nextRetryAt && job.nextRetryAt > nowMs))) job = null;
     }
     if (!job) {
-      // pending 且 nextRetryAt <= now（退避到期）。nextRetryAt=0/缺失视为立即可处理。
-      var hits = await searchJobs({ q: "", filter: 'status = "pending" AND nextRetryAt <= ' + nowMs, limit: 1, sort: ["createdAt:asc"] });
-      job = hits[0];
+      // 取 pending 任务（不在 SQL filter 里卡 nextRetryAt，否则缺失该字段的旧任务会被 Meilisearch 永久排除），
+      // 在代码里挑第一个退避已到期的（nextRetryAt 缺失/0/<=now 立即可处理）。
+      var hits = await searchJobs({ q: "", filter: 'status = "pending"', limit: 10, sort: ["createdAt:asc"] });
+      for (var hi = 0; hi < hits.length; hi++) {
+        if (!hits[hi].nextRetryAt || hits[hi].nextRetryAt <= nowMs) { job = hits[hi]; break; }
+      }
     }
     if (!job && recovered.length > 0) {
       job = recovered[0];
