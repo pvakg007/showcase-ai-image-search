@@ -58,6 +58,16 @@ export async function GET(req) {
     return sseOnce([{ type: "fatal", data: { stage: "setup", message: "任务不存在: " + jobId } }]);
   }
 
+  // files 丢失（历史数据/竞态）→ 标记失败并提示，绝不跑空流水线，也不写空 files
+  if (!job.files || job.files.length === 0) {
+    try {
+      await axios.post(MEILI() + "/indexes/processing_jobs/documents",
+        [{ id: jobId, status: "failed", error: "任务文件列表为空（files 字段丢失，可能需重新上传）", updatedAt: Date.now() }],
+        { headers: H() });
+    } catch (_) {}
+    return sseOnce([{ type: "fatal", data: { stage: "setup", message: "任务文件列表为空，请重新上传这些图片" } }]);
+  }
+
   // 任务已结束 → 推终态事件
   if (job.status === "completed" || job.status === "failed") {
     return sseOnce([{ type: job.status === "completed" ? "complete" : "fatal", data: { results: job.results || [], message: job.error || "" } }]);
@@ -111,7 +121,7 @@ export async function GET(req) {
           // 时间预算中止：仍有 pending 批 → 置 pending 触发后台续跑，告知前端转入后台
           try {
             await axios.post(MEILI() + "/indexes/processing_jobs/documents",
-              [{ id: jobId, status: "pending", processingLock: 0, results: result.results, batches: result.batches, files: job.files || [], aiPhase: "paused", updatedAt: Date.now() }],
+              [{ id: jobId, status: "pending", processingLock: 0, results: result.results, batches: result.batches, aiPhase: "paused", updatedAt: Date.now() }],
               { headers: H() });
           } catch (_) {}
           // fire-and-forget 触发后台接力（带 jobId 直达，避开索引延迟）

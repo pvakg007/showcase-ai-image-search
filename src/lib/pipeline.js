@@ -485,9 +485,13 @@ export async function runPipeline(job, opts) {
   }));
 
   // 合并 checkpoint：一次性写回所有 compressedKey（替代之前的逐张写，省 N 次 Meilisearch 往返）
+  // 关键：只在 updatedFiles 非空时才写 files。Meilisearch 部分更新(merge)不带的字段会原样保留，
+  // 所以绝不能写 files:[] —— 任何一次误写空数组都会永久清空任务文件，导致不可恢复。
   try {
-    await updateJob(jobId, { files: updatedFiles });
-    job.files = updatedFiles;
+    if (updatedFiles.length > 0) {
+      await updateJob(jobId, { files: updatedFiles });
+      job.files = updatedFiles;
+    }
     plog("Phase1 完成：checkpoint 已写回（" + updatedFiles.length + " 文件）");
   } catch (err) {
     plog("Phase1 checkpoint 写回失败（不阻塞）: " + err.message);
@@ -520,8 +524,9 @@ export async function runPipeline(job, opts) {
     if (progressLog.length > 30) progressLog = progressLog.slice(-30);
   }
   async function checkpointBatches() {
-    // 每次都带上 files，防止任何局部写入意外丢失 files 字段（后台续跑依赖它）
-    try { await updateJob(jobId, { batches: batches, results: results, progressLog: progressLog, files: job.files || [] }); }
+    // 不写 files：Meilisearch 部分更新(merge)会原样保留 files。绝不能写 files:job.files||[] ——
+    // 一旦内存 job.files 读到空(竞态/冷启动/索引延迟)就会把 files 永久清空，任务不可恢复。
+    try { await updateJob(jobId, { batches: batches, results: results, progressLog: progressLog }); }
     catch (err) { plog("checkpoint 写回失败（不阻塞）: " + err.message); }
   }
 

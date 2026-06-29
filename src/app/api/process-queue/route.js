@@ -69,9 +69,50 @@ function triggerNext(jobId) {
   } catch (_) {}
 }
 
+// ============================================================
+// 10 天保留期清理：失败任务保留 10 天内可随时重试，超期自动清理
+// 仅删 processing_jobs 任务记录，不影响 design_images 已生成的图片成品。
+// ============================================================
+var lastCleanupAt = 0;
+var CLEANUP_RETENTION_MS = 10 * 24 * 60 * 60 * 1000; // 10 天
+
+async function cleanupOldJobs() {
+  try {
+    var cutoff = Date.now() - CLEANUP_RETENTION_MS;
+    var oldJobs = await searchJobs({
+      q: "",
+      filter: 'status = "failed" AND createdAt < ' + cutoff,
+      limit: 50,
+      sort: ["createdAt:asc"],
+    });
+    for (var j of oldJobs) {
+      try {
+        await axios.delete(
+          MEILI() + "/indexes/processing_jobs/documents/" + encodeURIComponent(j.id),
+          { headers: { Authorization: "Bearer " + KEY() } }
+        );
+        console.log("[cleanup] 删除 10 天前的失败任务:", j.id, "createdAt=", j.createdAt);
+      } catch (_) {}
+    }
+    if (oldJobs.length > 0) console.log("[cleanup] 共清理", oldJobs.length, "个过期失败任务");
+  } catch (err) {
+    console.warn("[cleanup] 清理失败任务异常:", err.message);
+  }
+}
+
+/** 节流：最多每小时跑一次清理（nudge 频繁触发时避免重复查询；cron 每天 0 点必跑一次） */
+async function maybeCleanup() {
+  var now = Date.now();
+  if (now - lastCleanupAt < 3600000) return;
+  lastCleanupAt = now;
+  await cleanupOldJobs();
+}
+
 export async function GET(req) {
   try {
     var targetJobId = req && req.nextUrl ? req.nextUrl.searchParams.get("jobId") : null;
+    // 清理 10 天前的失败任务（节流，最多每小时一次）。失败任务在保留期内可随时重试，超期自动清理。
+    await maybeCleanup();
     var recovered = await recoverStuckJobs();
 
     // 选任务：优先 ?jobId 直达 → 否则搜 pending → 否则用刚恢复的（避开索引延迟）
